@@ -1,0 +1,34 @@
+schema_version: 1
+profile: ir4_7b_qlora_v1
+qa: references/training_qa.csv
+folds: references/folds/subject_grouped_v1/qa_folds.csv
+pilot: qa/pilot.csv
+fold_version: subject_grouped_v1
+splits:
+  train: [0, 1, 2]
+  dev: [3]
+  confirm: [4]
+# Relative to --data-root. Missing indices are reported, never fabricated.
+caches:
+  - frames_root: frames/fold_0
+    frame_index: frames/fold_0/uniform_time_v1/ir/520837f5b798f45a/frame_index.csv
+  - frames_root: frames/fold_1
+    frame_index: frames/fold_1/uniform_time_v1/ir/520837f5b798f45a/frame_index.csv
+  - frames_root: frames/fold_2
+    frame_index: frames/fold_2/uniform_time_v1/ir/520837f5b798f45a/frame_index.csv
+  - frames_root: frames/fold_3
+    frame_index: frames/fold_3/uniform_time_v1/ir/520837f5b798f45a/frame_index.csv
+  - frames_root: frames/fold_4
+    frame_index: frames/fold_4/uniform_time_v1/ir/520837f5b798f45a/frame_index.csv
+lora:
+  r: 8
+  alpha: 16
+  dropout: 0.05
+optimizer:
+  learning_rate: 0.00005
+  epochs: 1
+  gradient_accumulation_steps: 16
+  warmup_ratio: 0.03
+  max_grad_norm: 1.0
+  seed: 20260909
+  max_sequence_length: 4096

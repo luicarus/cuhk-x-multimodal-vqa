@@ -1,0 +1,11 @@
+schema_version: 1
+columns: [qa_id, prediction]
+require_template_id_order: true
+require_unique_ids: true
+allow_extra_rows: false
+allow_extra_columns: false
+test_qa: qa/test.csv
+template: qa/sample_submission.csv
+references:
+  pilot: references/pilot_answers.csv
+# Category-specific answer semantics remain defined by evaluation/metric.py.

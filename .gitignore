@@ -1,0 +1,91 @@
+# Python bytecode and build products
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.pyd
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+.conda/
+
+# Test, lint and type-check caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE and operating-system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Secrets and local-only configuration
+.env
+.env.*
+!.env.example
+kaggle.json
+**/kaggle.json
+*.local.yml
+*.local.yaml
+
+# Competition data and archives: governed by the CUHK-X data license
+*.zip
+*.7z
+*.rar
+*.tar
+*.tar.gz
+data/*
+!data/README.md
+
+# Videos and extracted frames
+*.mp4
+*.avi
+*.mov
+*.mkv
+frames/
+
+# Model weights and large tensor artifacts
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.safetensors
+*.onnx
+
+# Private experiment artifacts
+artifacts/*
+!artifacts/README.md
+outputs/
+logs/
+runs/
+wandb/
+mlruns/
+lightning_logs/
+
+# Model and dataset caches
+.cache/
+.uv-cache/
+huggingface/
+hf_cache/
+kagglehub/
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.swp
+~$*

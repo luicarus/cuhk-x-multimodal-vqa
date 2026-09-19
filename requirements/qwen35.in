@@ -1,0 +1,8 @@
+# Independent Qwen3.5-4B test lane; baseline cloud lock remains unchanged.
+Pillow==12.3.0
+PyYAML==6.0.3
+setuptools==78.1.0
+torch==2.7.1+cu126
+torchvision==0.22.1+cu126
+transformers==5.17.0
+accelerate==1.12.0

@@ -1,0 +1,34 @@
+schema_version: 1
+baseline_id: qwen35_4b_v1
+model:
+  id: Qwen/Qwen3.5-4B
+  revision: null  # The test notebook resolves and records an immutable revision.
+  architecture: qwen3_5
+  quantization: none
+  compute_dtype: float16
+  trust_remote_code: false
+  transformers:
+    version: 5.17.0
+    source: pypi
+frames:
+  modality: IR
+  protocol_version: uniform_time_v1
+  config_hash: 520837f5b798f45a
+  cache_num_frames: 8
+  input_num_frames: 4
+  selection: temporal_bin_centers
+  indices: [1, 3, 5, 7]
+  cache_image_size: 448
+  input_image_size: 280
+  cache_resize: letterbox
+prompt_version: cuhkx_mcq_v2
+generation:
+  do_sample: false
+  num_beams: 1
+  max_new_tokens: 8
+  constrained_decoding: true
+  enable_thinking: false
+runtime:
+  batch_size: 1
+  gpu_memory_mib: 12000
+  cpu_memory_gib: 13

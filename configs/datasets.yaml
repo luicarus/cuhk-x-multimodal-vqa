@@ -1,0 +1,16 @@
+schema_version: 1
+asset_manifest: asset_manifest.json
+# All dataset paths are relative to --data-root (default: <project-root>/data).
+datasets:
+  test:
+    qa: qa/test.csv
+    expected_qa: 682
+    split: test
+    frames_root: frames/test
+    frame_index: frames/test/uniform_time_v1/ir/520837f5b798f45a/frame_index.csv
+  pilot:
+    qa: qa/pilot.csv
+    expected_qa: 120
+    split: train
+    frames_root: frames/pilot
+    frame_index: frames/pilot/uniform_time_v1/ir/520837f5b798f45a/frame_index.csv
