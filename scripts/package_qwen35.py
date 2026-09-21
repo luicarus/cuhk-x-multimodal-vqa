@@ -23,7 +23,7 @@ ARCHIVE_NAME = "qwen35_4b.zip"
 # Declared in the manifest so the notebook can refuse a package built for
 # another engine. This lane is inference-only: the QLoRA package carries the
 # training stack, this one carries the vLLM generation engine.
-INFERENCE_ENGINE = "vllm_0.24.0_tensor_parallel"
+INFERENCE_ENGINE = "vllm_0.21.0_tensor_parallel"
 CODE_FILES = (
     "pyproject.toml", "src/cuhkx/__init__.py", "src/cuhkx/config.py", "src/cuhkx/cli.py",
     "src/cuhkx/release_security.py",
@@ -64,7 +64,7 @@ def collect(project: Path) -> dict[str, bytes]:
     payloads[PREFIX + "README.md"] = (
         "# Qwen3.5-4B IR4 vLLM test lane\n\n"
         "Independent model comparison. Use notebooks/qwen35-4b-vllm.ipynb.\n"
-        "Test inference runs on vLLM 0.24.0 with tensor parallelism across both\n"
+        "Test inference runs on vLLM 0.21.0 with tensor parallelism across both\n"
         "Kaggle T4 GPUs. This package is inference-only: it contains no training\n"
         "stack and no model weights.\n"
         "The Qwen2.5-VL-7B baseline package and results are not included or modified.\n"

@@ -25,7 +25,7 @@ CELLS = [
 固定相同的 IR4 输入：缓存 8 帧，使用第 2/4/6/8 张。只有模型、模型加载接口和依赖环境不同。
 将 `qwen35_4b.zip` 作为 Kaggle 私有输入，开启 2×T4 GPU 和 Internet；先执行 smoke，再执行完整 test。
 
-推理引擎：**vLLM 0.24.0，两卡张量并行（TP=2）**。这个包只做推理，不含训练栈。
+推理引擎：**vLLM 0.21.0，两卡张量并行（TP=2）**。这个包只做推理，不含训练栈。
 vLLM 用 `StructuredOutputsParams(choice=[...])` 约束到与 Transformers 相同的答案空间，
 引擎启动前会校验 chat 渲染，因此两条引擎的分数可直接比较。运行合同记录 `engine` 字段。
 """),
@@ -60,7 +60,7 @@ try:
     manifest = json.loads(read_member(MARKER))
     if manifest.get("schema_version") != 1 or manifest.get("package_id") != PACKAGE_ID:
         raise RuntimeError("不是当前 Qwen3.5 vLLM test 包")
-    if manifest.get("inference_engine") != "vllm_0.24.0_tensor_parallel":
+    if manifest.get("inference_engine") != "vllm_0.21.0_tensor_parallel":
         raise RuntimeError("这个包不是为 vLLM 双卡 lane 构建的")
     entries = manifest["files"]
     names = [entry["path"] for entry in entries]
@@ -99,7 +99,7 @@ print("Package SHA:", package_sha)
 print("Training included:", manifest["training_included"])
 print("Inference engine:", manifest["inference_engine"])
 '''),
-    cell("markdown", "## 2. 独立 Python 3.11 环境（Qwen3.5 专用，含 vLLM 0.24.0）"),
+    cell("markdown", "## 2. 独立 Python 3.11 环境（Qwen3.5 专用，含 vLLM 0.21.0）"),
     cell("code", '''
 VENV = RUNTIME / "venv"
 PYTHON = VENV / "bin/python"
@@ -224,7 +224,7 @@ CELLS[3]["source"] = secure_loader_source(
     runtime_prefix="qwen35_runtime_",
     repository_name="qwen35_repo",
     extra_validation='''
-if manifest.get("inference_engine") != "vllm_0.24.0_tensor_parallel":
+if manifest.get("inference_engine") != "vllm_0.21.0_tensor_parallel":
     raise RuntimeError("package was not built for the vLLM dual-GPU lane")
 ''',
     extra_prints='print("Training included:", manifest["training_included"])',
@@ -235,7 +235,7 @@ CELLS[0]["source"] = """# Qwen3.5-4B IR4 test (vLLM dual-GPU)
 
 This independent comparison reuses the existing IR8 cache and selects frames 2, 4, 6, and 8. Create the package locally, copy its printed `manifest_sha256` into `EXPECTED_MANIFEST_SHA256` in the first code cell, and attach that exact ZIP or extracted package as a private Kaggle input. The digest must come from a trusted local build.
 
-Test inference runs on **vLLM 0.24.0 with tensor parallelism across both T4 GPUs**. The engine constrains decoding to the same closed answer space as the Transformers backend and checks its chat rendering against the reference processor before starting, so its scores stay comparable with the other lanes. The signed run contract records the engine, so one run-id cannot mix results from two engines.
+Test inference runs on **vLLM 0.21.0 with tensor parallelism across both T4 GPUs**. The engine constrains decoding to the same closed answer space as the Transformers backend and checks its chat rendering against the reference processor before starting, so its scores stay comparable with the other lanes. The signed run contract records the engine, so one run-id cannot mix results from two engines.
 
 Use a Kaggle 2x T4 session and run the smoke check before complete test inference.
 """

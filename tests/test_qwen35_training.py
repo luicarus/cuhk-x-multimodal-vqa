@@ -1,4 +1,5 @@
 from pathlib import Path
+import re
 
 import pytest
 
@@ -41,10 +42,10 @@ def test_qwen35_train_lock_accepts_linux_markupsafe_wheel():
     assert "--index-url https://pypi.org/simple" in lock
     assert "--extra-index-url https://download.pytorch.org/whl/cu126" in lock
     assert "peft==0.18.0" in lock
-    # vLLM 0.24.0 pins the torch/torchvision pair and needs transformers>=5.5.3.
+    # vLLM 0.21.0 pins the torch/torchvision pair.
     assert "torchvision==0.26.0+cu126" in lock
     assert "torch==2.11.0+cu126" in lock
-    assert "vllm==0.24.0" in lock
+    assert "vllm==0.21.0" in lock
     assert "-r qwen35.in" in (PROJECT / "requirements/train_qwen35.in").read_text(encoding="utf-8")
     start = lock.index("markupsafe==3.0.3")
     block = lock[start:lock.index("\nmdurl==", start)]
@@ -53,7 +54,7 @@ def test_qwen35_train_lock_accepts_linux_markupsafe_wheel():
 
 def test_qwen35_inference_lock_pairs_vllm_with_transformers_five():
     lock = (PROJECT / "requirements/qwen35.lock.txt").read_text(encoding="utf-8")
-    for pin in ("vllm==0.24.0", "torch==2.11.0+cu126", "torchvision==0.26.0+cu126",
+    for pin in ("vllm==0.21.0", "torch==2.11.0+cu126", "torchvision==0.26.0+cu126",
                 "transformers==5.17.0"):
         assert pin in lock, pin
     # The structured-output backends are what enforce the closed answer space.
@@ -62,6 +63,31 @@ def test_qwen35_inference_lock_pairs_vllm_with_transformers_five():
     baseline = (PROJECT / "requirements/cloud.lock.txt").read_text(encoding="utf-8")
     assert "vllm==" not in baseline
     assert "torch==2.7.1+cu126" in baseline
+
+
+def _pinned_packages(lock_text):
+    return {match.group(1): match.group(2)
+            for match in re.finditer(r"^([A-Za-z0-9][A-Za-z0-9_.\-]*)==([^\s\\]+)", lock_text, re.M)}
+
+
+@pytest.mark.parametrize("name", ["qwen35.lock.txt", "train_qwen35.lock.txt"])
+def test_qwen35_locks_keep_one_cuda_major_version(name):
+    """A lock must not mix CUDA 12 and CUDA 13 packages.
+
+    vLLM declares `nvidia-cutlass-dsl[cu13]` from 0.22.1 onward. Combined with
+    a torch+cu126 build that yields a wheel set whose native extension links
+    libcudart.so.13 while only libcudart.so.12 is installed, so the lane fails
+    at `import vllm` on Kaggle's T4. Resolving successfully is not evidence that
+    the result is runnable; this guards the invariant directly.
+    """
+    pinned = _pinned_packages((PROJECT / "requirements" / name).read_text(encoding="utf-8"))
+    cuda13 = sorted(package for package in pinned if "cu13" in package)
+    cuda12 = sorted(package for package in pinned if package.endswith("-cu12"))
+    assert not cuda13, f"{name} pulls CUDA 13 packages alongside a cu126 torch: {cuda13}"
+    assert cuda12, f"{name} is missing the expected CUDA 12 runtime packages"
+    assert "torch==2.11.0+cu126" in (PROJECT / "requirements" / name).read_text(encoding="utf-8")
+    # The CUDA 13 cutlass stack is exactly what breaks the import.
+    assert "nvidia-cutlass-dsl-libs-cu13" not in pinned
 
 
 def test_qwen35_training_notebook_keeps_cuda_package_index():

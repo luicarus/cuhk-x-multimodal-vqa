@@ -18,7 +18,7 @@ Qwen3.5-4B 官方模型卡使用 `AutoModelForMultimodalLM` 与 `AutoProcessor.a
 
 ## vLLM 双卡推理
 
-本 lane 的 test 推理使用 **vLLM 0.24.0，两卡张量并行（TP=2）**；包清单声明 `inference_engine: vllm_0.24.0_tensor_parallel`，Notebook 在解包前会拒绝不匹配的包。这个包只做推理，不含训练栈；后训练 lane 见 `docs/qwen35_training.md`，产物是 `artifacts/cloud_training/qwen35_4b_qlora.zip`。
+本 lane 的 test 推理使用 **vLLM 0.21.0，两卡张量并行（TP=2）**；包清单声明 `inference_engine: vllm_0.21.0_tensor_parallel`，Notebook 在解包前会拒绝不匹配的包。这个包只做推理，不含训练栈；后训练 lane 见 `docs/qwen35_training.md`，产物是 `artifacts/cloud_training/qwen35_4b_qlora.zip`。
 
 - 参考后端用有状态的 `prefix_allowed_tokens_fn` 约束解码，vLLM 没有该 hook，改用 `StructuredOutputsParams(choice=[...])` 并锁到相同的字面前缀，保证两条引擎的答案空间一致。
 - 引擎构建前会用参考 processor 校验 chat 渲染（`enable_thinking=False`），因为答案边界依赖该精确编码。

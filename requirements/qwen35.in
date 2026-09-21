@@ -1,8 +1,16 @@
 # Independent Qwen3.5-4B test lane; baseline cloud lock remains unchanged.
 #
 # vLLM is a runtime dependency of this lane only. The Qwen2.5-VL-7B lane keeps
-# torch 2.7.1 + Transformers 4.57.6 and must never receive this package: vLLM
-# 0.24.0 requires transformers>=5.5.3 and pins torch==2.11.0.
+# torch 2.7.1 + Transformers 4.57.6 and must never receive this package.
+#
+# vLLM is pinned to 0.21.0 because it is the last release whose acceleration
+# stack targets CUDA 12: it declares a bare `nvidia-cutlass-dsl==4.4.2`.
+# From 0.22.1 onward vLLM declares `nvidia-cutlass-dsl[cu13]`, pulling a CUDA 13
+# runtime alongside torch's cu126 build. That combination fails at import with
+# "libcudart.so.13: cannot open shared object file", because torch==2.11.0+cu126
+# ships libcudart.so.12. Kaggle's T4 is SM 7.5 on a CUDA 12 driver, so the CUDA
+# 13 line is not usable there regardless of vLLM version.
+# vLLM also pins torch==2.11.0 and requires transformers>=4.56, both satisfied.
 Pillow==12.3.0
 PyYAML==6.0.3
 setuptools==78.1.0
@@ -10,4 +18,4 @@ torch==2.11.0+cu126
 torchvision==0.26.0+cu126
 transformers==5.17.0
 accelerate==1.12.0
-vllm==0.24.0
+vllm==0.21.0

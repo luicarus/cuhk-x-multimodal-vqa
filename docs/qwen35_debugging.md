@@ -18,7 +18,7 @@
 | `missing/non-finite LoRA gradients` | 自定义检查在 AMP `GradScaler` unscale 之前检查缩放梯度，把可恢复溢出当成失败 | 分开检查“梯度缺失”和“缩放溢出”；有 scaler 时让 AMP 决定跳步和降倍率 |
 | 四步均为 `grad_norm: nan`，最终 adapter 仍为零 | 默认 FP16 scale `65536` 过高，四个 optimizer step 全被跳过 | Qwen3.5 使用 `init_scale=1.0`、`growth_interval=16`；结束时仍严格验证 LoRA B 非零且指纹变化 |
 | `verify-run` 查找 `configs/training.yaml`，随后 confirm gate 失败 | Qwen3.5 Notebook 漏传训练配置，CLI 又采用 7B 默认路径 | 三处 `verify-run` 显式传入 `training_qwen35.yaml`；CLI 默认路径也改为按 profile 选择 |
-| vLLM 与固定环境冲突 | vLLM 0.24.0 要求 `transformers>=5.5.3` 并固定 `torch==2.11.0` | 本 lane 升到 `torch==2.11.0+cu126` / `torchvision==0.26.0+cu126` 并重新锁定；7B lane 保持 2.7.1 + Transformers 4.57.6，不安装 vLLM |
+| vLLM 与固定环境冲突 | vLLM 0.21.0 要求 `transformers>=5.5.3` 并固定 `torch==2.11.0` | 本 lane 升到 `torch==2.11.0+cu126` / `torchvision==0.26.0+cu126` 并重新锁定；7B lane 保持 2.7.1 + Transformers 4.57.6，不安装 vLLM |
 | vLLM 对答案空间的约束与 Transformers 不一致 | vLLM 没有 `prefix_allowed_tokens_fn` 钩子 | 用 `StructuredOutputsParams(choice=[...])` 约束同一语言，并把每条答案固定为字面前缀；引擎启动前用参考 processor 校验 chat 渲染 |
 | 双 T4 上 vLLM 张量并行卡死或崩溃 | 两块 T4 无 NVLink，PCIe 上的 CUDA graph 捕获与 peer-to-peer 探测不稳定 | `enforce_eager=True`、`disable_custom_all_reduce=True`、`NCCL_P2P_DISABLE=1`，并用 `gpu_memory_utilization=0.80` 给 KV cache 留边界 |
 

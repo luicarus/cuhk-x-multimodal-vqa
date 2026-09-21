@@ -29,7 +29,7 @@ CELLS = [
 | 阶段 | 引擎 | 原因 |
 |---|---|---|
 | 训练 / 训练中 dev 评估 | Transformers 5.17.0 | vLLM 只做推理，无法反传梯度 |
-| adapter 重载、dev/confirm 评估、test 推理 | **vLLM 0.24.0，TP=2** | 两卡张量并行加速 |
+| adapter 重载、dev/confirm 评估、test 推理 | **vLLM 0.21.0，TP=2** | 两卡张量并行加速 |
 
 两边共用同一份数据契约、prompt、答案空间和运行校验，因此 vLLM 的分数与 Transformers 可直接比较。运行合同记录 `engine` 字段，同一 run-id 不会混用两种引擎的结果。
 """),
@@ -159,7 +159,7 @@ if data_state["status"] != "PASS":
     raise RuntimeError("embedded five-fold caches are incomplete")
 print(json.dumps(data_state["coverage"], indent=2))
 '''),
-    cell("markdown", "## 3. 安装 Qwen3.5 后训练依赖（含 vLLM 0.24.0）并固定双卡环境"),
+    cell("markdown", "## 3. 安装 Qwen3.5 后训练依赖（含 vLLM 0.21.0）并固定双卡环境"),
     cell("code", r'''
 subprocess.run([str(PYTHON), "-m", "pip", "install", "--require-hashes",
                 "--only-binary=:all:", "--index-url", "https://pypi.org/simple",
@@ -310,7 +310,7 @@ CELLS[3]["source"] = secure_loader_source(
     extra_validation='''
 if manifest.get("training_cache_mode") != "embedded_complete":
     raise RuntimeError("training package does not contain the complete cache")
-if manifest.get("inference_engine") != "vllm_0.24.0_tensor_parallel":
+if manifest.get("inference_engine") != "vllm_0.21.0_tensor_parallel":
     raise RuntimeError("training package was not built for the vLLM dual-GPU lane")
 ''',
     extra_prints='print("Package:", PACKAGE_ID)',
@@ -321,7 +321,7 @@ CELLS[0]["source"] = """# Qwen3.5-4B QLoRA: vLLM Dual-GPU
 
 This independent training notebook reuses the existing IR4 input protocol and embeds the complete five-fold cache. Create the package locally, copy its printed `manifest_sha256` into `EXPECTED_MANIFEST_SHA256` in the first code cell, and attach that exact `qwen35_4b_qlora.zip` as a private Kaggle input. This authenticates the manifest before any project code is copied or installed.
 
-Training and evaluation-under-training stay on Transformers, because vLLM is inference-only. Adapter reload checks, dev/confirm evaluation, and test inference run on **vLLM 0.24.0 with tensor parallelism across both T4 GPUs**. Both engines share the same data contract and constrained answer space, and the run contract records which engine produced each result.
+Training and evaluation-under-training stay on Transformers, because vLLM is inference-only. Adapter reload checks, dev/confirm evaluation, and test inference run on **vLLM 0.21.0 with tensor parallelism across both T4 GPUs**. Both engines share the same data contract and constrained answer space, and the run contract records which engine produced each result.
 
 The package contains no model weights. Use a Kaggle 2x T4 session; the notebook verifies that both GPUs are visible before vLLM starts.
 """
