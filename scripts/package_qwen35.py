@@ -36,7 +36,7 @@ CODE_FILES = (
     "configs/baseline.yaml", "configs/qwen35_4b.yaml", "configs/datasets.yaml", "configs/submission.yaml",
     "requirements/bootstrap.lock.txt", "requirements/cpu.in", "requirements/cpu.lock.txt",
     "requirements/qwen35.in", "requirements/qwen35.lock.txt",
-    "requirements/README.md", "docs/qwen35_4b.md", "notebooks/qwen35-4b-test.ipynb",
+    "requirements/README.md", "docs/qwen35_4b.md", "notebooks/qwen35-4b-vllm.ipynb",
 )
 DATA_FILES = {"data/qa/test.csv", "data/qa/pilot.csv", "data/qa/sample_submission.csv"}
 DATA_PREFIXES = ("data/frames/test/", "data/frames/pilot/")
@@ -63,7 +63,7 @@ def collect(project: Path) -> dict[str, bytes]:
         payloads[PREFIX + relative] = path.read_bytes()
     payloads[PREFIX + "README.md"] = (
         "# Qwen3.5-4B IR4 vLLM test lane\n\n"
-        "Independent model comparison. Use notebooks/qwen35-4b-test.ipynb.\n"
+        "Independent model comparison. Use notebooks/qwen35-4b-vllm.ipynb.\n"
         "Test inference runs on vLLM 0.24.0 with tensor parallelism across both\n"
         "Kaggle T4 GPUs. This package is inference-only: it contains no training\n"
         "stack and no model weights.\n"

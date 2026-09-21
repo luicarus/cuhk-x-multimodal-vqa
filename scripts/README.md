@@ -5,7 +5,7 @@
 - `package_training.py`：只生成包含完整五折缓存的独立后训练 ZIP；数据不齐时拒绝打包。
 - `build_training_notebook.py`：只创建完整数据版后训练 Notebook，拒绝覆盖已存在文件，不操作 baseline Notebook。
 - `package_qwen35.py`：生成独立 Qwen3.5-4B test 包 `artifacts/cloud/qwen35_4b.zip`，test 推理走 vLLM 0.24.0 双卡张量并行，声明 `inference_engine: vllm_0.24.0_tensor_parallel`；复用 test/pilot IR4 缓存，不包含训练栈和模型权重。
-- `build_qwen35_notebook.py`：创建独立 Qwen3.5-4B vLLM test Notebook，拒绝覆盖已存在文件。
+- `build_qwen35_notebook.py`：创建独立 Qwen3.5-4B vLLM test Notebook（`notebooks/qwen35-4b-vllm.ipynb`），拒绝覆盖已存在文件。
 
 业务操作统一使用 CLI，原 baseline Notebook 不提供生成器或覆盖入口。
 

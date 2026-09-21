@@ -168,7 +168,7 @@ def test_uv_bootstrap_is_hash_locked_and_used_by_every_notebook_lane():
     for path in (
         PROJECT / "notebooks/cuhk-x-base7b.ipynb",
         PROJECT / "notebooks/cuhk-x-qlora-full-v3.ipynb",
-        PROJECT / "notebooks/qwen35-4b-test.ipynb",
+        PROJECT / "notebooks/qwen35-4b-vllm.ipynb",
         PROJECT / "notebooks/qwen35-4b-qlora-vllm.ipynb",
         PROJECT / "scripts/build_qwen35_notebook.py",
         PROJECT / "scripts/build_training_notebook.py",

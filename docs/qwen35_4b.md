@@ -6,7 +6,7 @@ Qwen3.5-4B 官方模型卡使用 `AutoModelForMultimodalLM` 与 `AutoProcessor.a
 
 ## 文件
 
-- Notebook：`notebooks/qwen35-4b-test.ipynb`
+- Notebook：`notebooks/qwen35-4b-vllm.ipynb`
 - ZIP：`artifacts/cloud/qwen35_4b.zip`
 - 配置：`configs/qwen35_4b.yaml`
 - 后端（vLLM 生成）：`src/cuhkx/inference/qwen35_vllm.py`

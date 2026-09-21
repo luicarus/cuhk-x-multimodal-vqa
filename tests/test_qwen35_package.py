@@ -30,7 +30,7 @@ def test_qwen35_package_allowlist_and_extraction(tmp_path):
         assert manifest["inference_engine"] == PACKAGE.INFERENCE_ENGINE
         assert manifest["tensor_parallel_size"] == 2
         names = set(zipped.namelist())
-        assert "qwen35_repo/notebooks/qwen35-4b-test.ipynb" in names
+        assert "qwen35_repo/notebooks/qwen35-4b-vllm.ipynb" in names
         assert "qwen35_repo/notebooks/cuhk-x-base7b.ipynb" not in names
         assert not any("training/" in name or "artifacts/" in name for name in names)
         assert zipped.read("qwen35_repo/src/cuhkx/inference/qwen35.py") == (ROOT / "src/cuhkx/inference/qwen35.py").read_bytes()

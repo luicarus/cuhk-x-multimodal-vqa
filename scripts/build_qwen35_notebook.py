@@ -242,7 +242,7 @@ Use a Kaggle 2x T4 session and run the smoke check before complete test inferenc
 
 
 def build(*, force: bool = False) -> Path:
-    target = Path(__file__).resolve().parents[1] / "notebooks/qwen35-4b-test.ipynb"
+    target = Path(__file__).resolve().parents[1] / "notebooks/qwen35-4b-vllm.ipynb"
     if target.exists() and not force:
         raise FileExistsError("Qwen3.5 notebook already exists; use --force to regenerate it")
     for index, item in enumerate(CELLS):
