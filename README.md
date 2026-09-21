@@ -72,16 +72,9 @@ flowchart LR
 | Qwen3.5-4B baseline | [`qwen35-4b-test.ipynb`](notebooks/qwen35-4b-test.ipynb) | `artifacts/cloud/qwen35_4b_test_v1.zip` |
 | Qwen3.5-4B QLoRA | [`qwen35-4b-qlora-vllm.ipynb`](notebooks/qwen35-4b-qlora-vllm.ipynb) | `artifacts/cloud_training/qwen35_4b.zip` |
 
-模型权重不提交到 Git。Notebook 可以下载固定 revision，或读取带来源收据的私有 Kaggle Input。ZIP 不提交到 Git，需由维护者通过 Kaggle Input 等渠道另行提供。运行预制包时，必须把与该 ZIP 对应的可信 `manifest_sha256` 填入 Notebook 的 `EXPECTED_MANIFEST_SHA256`；不要从 ZIP 自身读取期望值。
+模型权重不提交到 Git。Notebook 可以下载固定 revision，或读取带来源收据的私有 Kaggle Input。ZIP 不提交到 Git，需由维护者通过 Kaggle Input 等渠道另行提供。
 
-以下摘要对应 **2026-09-19** 本地生成的精确 ZIP。拿到匹配文件后，用对应值填写其 Notebook；重新打包后摘要会改变。自行打包时，运行对应脚本并复制终端输出的 `manifest_sha256`。
-
-| ZIP | Notebook | `manifest_sha256` |
-|---|---|---|
-| `ir4_7b_v1.zip` | [`cuhk-x-base7b.ipynb`](notebooks/cuhk-x-base7b.ipynb) | `fff77f48080f294c36645f6a90315cfdd984eb295b5f2470e8581f4607db8f6a` |
-| `cuhkx-ir4-qlora-full-v3.zip` | [`cuhk-x-qlora-full-v3.ipynb`](notebooks/cuhk-x-qlora-full-v3.ipynb) | `08826da463ec22dbfa1fd6aa47bcf24e0bd10f8757aaf7a918a8dc19ca3d9fa9` |
-| `qwen35_4b_test_v1.zip` | [`qwen35-4b-test.ipynb`](notebooks/qwen35-4b-test.ipynb) | `0e2d1a6ef90c07a6b25645a169d35ddb1c9c87690e8f1855057f44082cda7661` |
-| `qwen35_4b.zip` | [`qwen35-4b-qlora-vllm.ipynb`](notebooks/qwen35-4b-qlora-vllm.ipynb) | `abd7106fc7e2a67a878576799cc2de234ad15b3a66fa440ab671450c18d8b355` |
+运行预制包时，必须把与该 ZIP 对应的可信 `manifest_sha256` 填入 Notebook 的 `EXPECTED_MANIFEST_SHA256`；不要从 ZIP 自身读取期望值。自行打包时，运行对应脚本并复制终端输出的 `manifest_sha256`。
 
 ## 本地校验
 
