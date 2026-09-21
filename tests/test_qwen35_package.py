@@ -27,11 +27,15 @@ def test_qwen35_package_allowlist_and_extraction(tmp_path):
         assert manifest["model_id"] == "Qwen/Qwen3.5-4B"
         assert manifest["model_revision"] is None
         assert manifest["training_included"] is False
+        assert manifest["inference_engine"] == PACKAGE.INFERENCE_ENGINE
+        assert manifest["tensor_parallel_size"] == 2
         names = set(zipped.namelist())
         assert "qwen35_repo/notebooks/qwen35-4b-test.ipynb" in names
         assert "qwen35_repo/notebooks/cuhk-x-base7b.ipynb" not in names
         assert not any("training/" in name or "artifacts/" in name for name in names)
         assert zipped.read("qwen35_repo/src/cuhkx/inference/qwen35.py") == (ROOT / "src/cuhkx/inference/qwen35.py").read_bytes()
+        # The vLLM engine is the whole point of this lane, so it must ship.
+        assert zipped.read("qwen35_repo/src/cuhkx/inference/qwen35_vllm.py") == (ROOT / "src/cuhkx/inference/qwen35_vllm.py").read_bytes()
         assert zipped.read("qwen35_repo/configs/qwen35_4b.yaml") == (ROOT / "configs/qwen35_4b.yaml").read_bytes()
         for entry in manifest["files"]:
             content = zipped.read(entry["path"])

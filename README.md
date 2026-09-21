@@ -69,8 +69,8 @@ flowchart LR
 |---|---|---|
 | Qwen2.5-VL-7B baseline | [`cuhk-x-base7b.ipynb`](notebooks/cuhk-x-base7b.ipynb) | `artifacts/cloud/ir4_7b_v1.zip` |
 | Qwen2.5-VL-7B QLoRA | [`cuhk-x-qlora-full-v3.ipynb`](notebooks/cuhk-x-qlora-full-v3.ipynb) | `artifacts/cloud_training/cuhkx-ir4-qlora-full-v3.zip` |
-| Qwen3.5-4B baseline | [`qwen35-4b-test.ipynb`](notebooks/qwen35-4b-test.ipynb) | `artifacts/cloud/qwen35_4b_test_v1.zip` |
-| Qwen3.5-4B QLoRA | [`qwen35-4b-qlora-vllm.ipynb`](notebooks/qwen35-4b-qlora-vllm.ipynb) | `artifacts/cloud_training/qwen35_4b.zip` |
+| Qwen3.5-4B baseline | [`qwen35-4b-test.ipynb`](notebooks/qwen35-4b-test.ipynb) | `artifacts/cloud/qwen35_4b.zip` |
+| Qwen3.5-4B QLoRA | [`qwen35-4b-qlora-vllm.ipynb`](notebooks/qwen35-4b-qlora-vllm.ipynb) | `artifacts/cloud_training/qwen35_4b_qlora.zip` |
 
 模型权重不提交到 Git。Notebook 可以下载固定 revision，或读取带来源收据的私有 Kaggle Input。ZIP 不提交到 Git，需由维护者通过 Kaggle Input 等渠道另行提供。
 

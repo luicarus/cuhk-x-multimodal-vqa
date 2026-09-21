@@ -16,11 +16,11 @@ PROJECT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT / "src"))
 from cuhkx.release_security import extract_verified_archive
 
-PACKAGE_ID = "cuhkx-qwen35-4b-vllm-full-v1"
+PACKAGE_ID = "cuhkx-qwen35-4b-qlora-vllm-v1"
 MANIFEST = "qwen35_training_bundle_manifest.json"
 PREFIX = "qwen35_training_repo/"
 NOTEBOOK = "notebooks/qwen35-4b-qlora-vllm.ipynb"
-ARCHIVE_NAME = "qwen35_4b.zip"
+ARCHIVE_NAME = "qwen35_4b_qlora.zip"
 INFERENCE_ENGINE = "vllm_0.24.0_tensor_parallel"
 DATA_FILES = {
     "data/qa/test.csv", "data/qa/pilot.csv", "data/qa/sample_submission.csv",

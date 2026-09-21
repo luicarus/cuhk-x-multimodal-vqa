@@ -3,10 +3,12 @@
 This lane fine-tunes `Qwen/Qwen3.5-4B` with the existing IR4 data contract and complete five-fold IR8 cache. It has its own Transformers 5.17.0 / vLLM 0.24.0 environment; the Qwen2.5-VL-7B v3 lane is unchanged.
 
 - Notebook: `notebooks/qwen35-4b-qlora-vllm.ipynb`
-- Package: `artifacts/cloud_training/qwen35_4b.zip`
+- Package: `artifacts/cloud_training/qwen35_4b_qlora.zip`
 - Config: `configs/training_qwen35.yaml`
 - Training profile: `qwen35_4b_qlora_v1`
 - vLLM backend: `src/cuhkx/inference/qwen35_vllm.py`
+
+This is the **post-training** lane. The inference-only lane produces `artifacts/cloud/qwen35_4b.zip` and does not carry the training stack; see `docs/qwen35_4b.md`.
 
 The package does not contain model weights. The Notebook resolves and pins a Qwen3.5 commit, downloads or reuses a verified weight directory, runs CPU data checks, then performs a cloud CUDA smoke run before any full training. Formal test submission stays gated on dev and confirm improvements.
 

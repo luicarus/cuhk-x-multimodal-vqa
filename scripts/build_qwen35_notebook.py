@@ -20,10 +20,14 @@ def cell(kind: str, source: str) -> dict:
 
 CELLS = [
     cell("markdown", """
-# Qwen3.5-4B IR4 test （修复版）
+# Qwen3.5-4B IR4 test（vLLM 双卡版）
 此 Notebook 是独立模型对照，不读取或修改 Qwen2.5-VL-7B baseline 的 Notebook、运行目录或 ZIP。
 固定相同的 IR4 输入：缓存 8 帧，使用第 2/4/6/8 张。只有模型、模型加载接口和依赖环境不同。
-将 `qwen35_4b_test_v1.zip` 作为 Kaggle 私有输入，开启 GPU 和 Internet；先执行 smoke，再执行完整 test。
+将 `qwen35_4b.zip` 作为 Kaggle 私有输入，开启 2×T4 GPU 和 Internet；先执行 smoke，再执行完整 test。
+
+推理引擎：**vLLM 0.24.0，两卡张量并行（TP=2）**。这个包只做推理，不含训练栈。
+vLLM 用 `StructuredOutputsParams(choice=[...])` 约束到与 Transformers 相同的答案空间，
+引擎启动前会校验 chat 渲染，因此两条引擎的分数可直接比较。运行合同记录 `engine` 字段。
 """),
     cell("code", '''
 from pathlib import Path, PurePosixPath
@@ -34,15 +38,17 @@ WORK = Path("/kaggle/working")
 BUNDLE_INPUT = None  # ZIP，或含 qwen35_bundle_manifest.json 的已解压目录
 WEIGHTS_INPUT = None  # 可选：含 cuhkx_qwen35_weights.json 的完整权重目录
 PINNED_REVISION = ""  # 留空则由固定环境中的 HfApi 解析并写入运行副本
+TENSOR_PARALLEL = 2    # vLLM 张量并行度：2×T4
+GPU_MEMORY_UTILIZATION = 0.80
 '''),
-    cell("markdown", "## 1. 验证 Qwen3.5 包并准备独立工作目录"),
+    cell("markdown", "## 1. 验证 Qwen3.5 vLLM 包并准备独立工作目录"),
     cell("code", '''
-PACKAGE_ID = "cuhkx-qwen35-4b-test-v1"
+PACKAGE_ID = "cuhkx-qwen35-4b-vllm-v1"
 MARKER = "qwen35_bundle_manifest.json"
 if BUNDLE_INPUT is None:
     candidates = [p.parent for p in INPUT.rglob(MARKER)]
     if not candidates:
-        candidates = list(INPUT.rglob("qwen35_4b_test_v1.zip"))
+        candidates = list(INPUT.rglob("qwen35_4b.zip"))
     if len(candidates) != 1:
         raise RuntimeError(f"需要恰好一个 Qwen3.5 包，找到 {len(candidates)} 个；请设置 BUNDLE_INPUT")
     BUNDLE_INPUT = candidates[0]
@@ -53,7 +59,9 @@ try:
         return archive.read(name) if archive else (BUNDLE_INPUT / name).read_bytes()
     manifest = json.loads(read_member(MARKER))
     if manifest.get("schema_version") != 1 or manifest.get("package_id") != PACKAGE_ID:
-        raise RuntimeError("不是当前 Qwen3.5 test 包")
+        raise RuntimeError("不是当前 Qwen3.5 vLLM test 包")
+    if manifest.get("inference_engine") != "vllm_0.24.0_tensor_parallel":
+        raise RuntimeError("这个包不是为 vLLM 双卡 lane 构建的")
     entries = manifest["files"]
     names = [entry["path"] for entry in entries]
     if len(names) != len(set(names)):
@@ -89,8 +97,9 @@ finally:
 print("Qwen3.5 project:", REPO)
 print("Package SHA:", package_sha)
 print("Training included:", manifest["training_included"])
+print("Inference engine:", manifest["inference_engine"])
 '''),
-    cell("markdown", "## 2. 独立 Python 3.11 环境（Qwen3.5 专用）"),
+    cell("markdown", "## 2. 独立 Python 3.11 环境（Qwen3.5 专用，含 vLLM 0.24.0）"),
     cell("code", '''
 VENV = RUNTIME / "venv"
 PYTHON = VENV / "bin/python"
@@ -106,6 +115,23 @@ subprocess.run([str(PYTHON), "-m", "pip", "install", "--require-hashes", "--only
                 "-r", str(REPO / "requirements/qwen35.lock.txt")], check=True)
 subprocess.run([str(PYTHON), "-m", "pip", "install", "--no-deps", "--no-build-isolation", "-e", str(REPO)], check=True)
 subprocess.run([str(PYTHON), "-m", "pip", "check"], check=True)
+compatibility_probe = (
+    "import json, transformers, torch, vllm; "
+    "print(json.dumps({'transformers': transformers.__version__, 'vllm': vllm.__version__, "
+    "'torch': torch.__version__}))"
+)
+print(subprocess.check_output([str(PYTHON), "-c", compatibility_probe], text=True))
+probe = ("import json,sys,torch; assert sys.version_info[:2]==(3,11); "
+         "assert torch.cuda.is_available(), 'a cloud CUDA GPU is required'; "
+         "count=torch.cuda.device_count(); "
+         "assert count>=TENSOR_PARALLEL_COUNT, f'vLLM TP={TENSOR_PARALLEL_COUNT} needs that many GPUs'; "
+         "print(json.dumps({'python':sys.version,'torch':torch.__version__,"
+         "'cuda':torch.version.cuda,'device_count':count,"
+         "'devices':[torch.cuda.get_device_name(i) for i in range(count)]}))")
+environment = subprocess.check_output(
+    [str(PYTHON), "-c", f"TENSOR_PARALLEL_COUNT={TENSOR_PARALLEL};{probe}"], text=True)
+(RUNTIME / "environment.json").write_text(environment, encoding="utf-8")
+print(environment)
 CLOUD_ENV = {**os.environ, "PYTHONPATH": str(REPO / "src"), "PYTHONDONTWRITEBYTECODE": "1",
              "PYTHONUNBUFFERED": "1", "CUHKX_TRACEBACK": "1"}
 
@@ -159,15 +185,24 @@ cloud("check", "--profile", "qwen35", "--dataset", "pilot")
 print("Qwen3.5 weights:", WEIGHTS)
 print("Qwen3.5 revision:", PINNED_REVISION)
 '''),
-    cell("markdown", "## 4. Smoke：test 前 16 QA"),
+    cell("markdown", "## 4. vLLM 双卡 smoke：test 前 16 QA，验证 TP=2 引擎与答案约束"),
     cell("code", '''
-cloud("predict", "--profile", "qwen35", "--dataset", "test", "--limit", "16",
+VLLM = ["--backend", "vllm", "--tensor-parallel-size", str(TENSOR_PARALLEL),
+        "--gpu-memory-utilization", str(GPU_MEMORY_UTILIZATION)]
+cloud("predict", "--profile", "qwen35", *VLLM, "--dataset", "test", "--limit", "16",
       "--run-id", "qwen35_4b_smoke", "--weights-dir", str(WEIGHTS), "--resume")
 cloud("verify-run", "--profile", "qwen35", "--run-id", "qwen35_4b_smoke")
+smoke = json.loads((REPO / "outputs/qwen35_4b_smoke/run_summary.json").read_text())
+backend_metadata = smoke["backend"]
+if backend_metadata.get("backend") != "qwen35_4b_vllm":
+    raise RuntimeError("smoke run did not use the vLLM engine")
+if backend_metadata.get("tensor_parallel_size") != TENSOR_PARALLEL:
+    raise RuntimeError(f"vLLM ran with TP={backend_metadata.get('tensor_parallel_size')}, expected {TENSOR_PARALLEL}")
+print(json.dumps(backend_metadata, indent=2))
 '''),
-    cell("markdown", "## 5. 完整 test：682 QA 与提交文件"),
+    cell("markdown", "## 5. 完整 test：682 QA 与提交文件（vLLM）"),
     cell("code", '''
-cloud("predict", "--profile", "qwen35", "--dataset", "test",
+cloud("predict", "--profile", "qwen35", *VLLM, "--dataset", "test",
       "--run-id", "qwen35_4b_test", "--weights-dir", str(WEIGHTS), "--resume")
 cloud("verify-run", "--profile", "qwen35", "--run-id", "qwen35_4b_test")
 cloud("submit", "--profile", "qwen35", "--run-id", "qwen35_4b_test")
@@ -181,22 +216,28 @@ CELLS[1]["source"] = CELLS[1]["source"].replace(
     "BUNDLE_INPUT = None\nEXPECTED_MANIFEST_SHA256 = None  # paste manifest_sha256 from the trusted package command",
 )
 CELLS[3]["source"] = secure_loader_source(
-    package_id="cuhkx-qwen35-4b-test-v1",
+    package_id="cuhkx-qwen35-4b-vllm-v1",
     identity_key="package_id",
     marker="qwen35_bundle_manifest.json",
     prefix="qwen35_repo/",
-    zip_name="qwen35_4b_test_v1.zip",
+    zip_name="qwen35_4b.zip",
     runtime_prefix="qwen35_runtime_",
     repository_name="qwen35_repo",
+    extra_validation='''
+if manifest.get("inference_engine") != "vllm_0.24.0_tensor_parallel":
+    raise RuntimeError("package was not built for the vLLM dual-GPU lane")
+''',
     extra_prints='print("Training included:", manifest["training_included"])',
 )
 
 
-CELLS[0]["source"] = """# Qwen3.5-4B IR4 test
+CELLS[0]["source"] = """# Qwen3.5-4B IR4 test (vLLM dual-GPU)
 
 This independent comparison reuses the existing IR8 cache and selects frames 2, 4, 6, and 8. Create the package locally, copy its printed `manifest_sha256` into `EXPECTED_MANIFEST_SHA256` in the first code cell, and attach that exact ZIP or extracted package as a private Kaggle input. The digest must come from a trusted local build.
 
-Use a Kaggle CUDA GPU and run the smoke check before complete test inference.
+Test inference runs on **vLLM 0.24.0 with tensor parallelism across both T4 GPUs**. The engine constrains decoding to the same closed answer space as the Transformers backend and checks its chat rendering against the reference processor before starting, so its scores stay comparable with the other lanes. The signed run contract records the engine, so one run-id cannot mix results from two engines.
+
+Use a Kaggle 2x T4 session and run the smoke check before complete test inference.
 """
 
 

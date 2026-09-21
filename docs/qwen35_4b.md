@@ -7,13 +7,23 @@ Qwen3.5-4B 官方模型卡使用 `AutoModelForMultimodalLM` 与 `AutoProcessor.a
 ## 文件
 
 - Notebook：`notebooks/qwen35-4b-test.ipynb`
-- ZIP：`artifacts/cloud/qwen35_4b_test_v1.zip`
+- ZIP：`artifacts/cloud/qwen35_4b.zip`
 - 配置：`configs/qwen35_4b.yaml`
-- 后端：`src/cuhkx/inference/qwen35.py`
+- 后端（vLLM 生成）：`src/cuhkx/inference/qwen35_vllm.py`
+- 后端（Transformers 参考）：`src/cuhkx/inference/qwen35.py`
 - 权重来源校验：`src/cuhkx/inference/qwen35_weights.py`
 - 依赖：`requirements/qwen35.lock.txt`
 
 新包不包含模型权重，权重目录需要由 Notebook 下载或作为带 `cuhkx_qwen35_weights.json` 的私有 Input 挂载。模型 revision 首次由 Notebook 解析并写入运行副本；同一运行的 checkpoint 和结果只接受该 revision。
+
+## vLLM 双卡推理
+
+本 lane 的 test 推理使用 **vLLM 0.24.0，两卡张量并行（TP=2）**；包清单声明 `inference_engine: vllm_0.24.0_tensor_parallel`，Notebook 在解包前会拒绝不匹配的包。这个包只做推理，不含训练栈；后训练 lane 见 `docs/qwen35_training.md`，产物是 `artifacts/cloud_training/qwen35_4b_qlora.zip`。
+
+- 参考后端用有状态的 `prefix_allowed_tokens_fn` 约束解码，vLLM 没有该 hook，改用 `StructuredOutputsParams(choice=[...])` 并锁到相同的字面前缀，保证两条引擎的答案空间一致。
+- 引擎构建前会用参考 processor 校验 chat 渲染（`enable_thinking=False`），因为答案边界依赖该精确编码。
+- 两张 T4 没有 NVLink，因此引擎使用 `enforce_eager=True`、`disable_custom_all_reduce=True`、`NCCL_P2P_DISABLE=1`，避免 PCIe 上的 CUDA graph capture 和 P2P 探测导致挂起。
+- 运行合同记录 `engine` / `engine_options`，同一 run-id 不会混用两种引擎的结果。
 
 ## 云端运行
 
@@ -32,8 +42,8 @@ qwen35_repo/
 默认先运行 test 前 16 QA smoke，再运行完整 682 QA：
 
 ```bash
-cuhkx predict --profile qwen35 --dataset test --limit 16 --run-id qwen35_4b_smoke --weights-dir <weights> --resume
-cuhkx predict --profile qwen35 --dataset test --run-id qwen35_4b_test --weights-dir <weights> --resume
+cuhkx predict --profile qwen35 --backend vllm --tensor-parallel-size 2 --dataset test --limit 16 --run-id qwen35_4b_smoke --weights-dir <weights> --resume
+cuhkx predict --profile qwen35 --backend vllm --tensor-parallel-size 2 --dataset test --run-id qwen35_4b_test --weights-dir <weights> --resume
 cuhkx verify-run --profile qwen35 --run-id qwen35_4b_test
 cuhkx submit --profile qwen35 --run-id qwen35_4b_test
 ```

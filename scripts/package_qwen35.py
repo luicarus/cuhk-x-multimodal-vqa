@@ -1,4 +1,4 @@
-"""Build an independent Qwen3.5-4B test package; the Qwen2.5-VL baseline is untouched."""
+"""Build an independent Qwen3.5-4B vLLM test package; the Qwen2.5-VL baseline is untouched."""
 from __future__ import annotations
 
 import argparse
@@ -16,15 +16,21 @@ PROJECT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT / "src"))
 from cuhkx.release_security import extract_verified_archive
 
-PACKAGE_ID = "cuhkx-qwen35-4b-test-v1"
+PACKAGE_ID = "cuhkx-qwen35-4b-vllm-v1"
 MANIFEST = "qwen35_bundle_manifest.json"
 PREFIX = "qwen35_repo/"
+ARCHIVE_NAME = "qwen35_4b.zip"
+# Declared in the manifest so the notebook can refuse a package built for
+# another engine. This lane is inference-only: the QLoRA package carries the
+# training stack, this one carries the vLLM generation engine.
+INFERENCE_ENGINE = "vllm_0.24.0_tensor_parallel"
 CODE_FILES = (
     "pyproject.toml", "src/cuhkx/__init__.py", "src/cuhkx/config.py", "src/cuhkx/cli.py",
     "src/cuhkx/release_security.py",
     "src/cuhkx/data/__init__.py", "src/cuhkx/data/inputs.py", "src/cuhkx/data/validate.py",
     "src/cuhkx/inference/__init__.py", "src/cuhkx/inference/prompt.py", "src/cuhkx/inference/qwen35.py",
-    "src/cuhkx/inference/qwen35_weights.py", "src/cuhkx/inference/runner.py", "src/cuhkx/inference/storage.py",
+    "src/cuhkx/inference/qwen35_vllm.py", "src/cuhkx/inference/qwen35_weights.py",
+    "src/cuhkx/inference/runner.py", "src/cuhkx/inference/storage.py",
     "src/cuhkx/evaluation/__init__.py", "src/cuhkx/evaluation/metric.py",
     "src/cuhkx/submission/__init__.py", "src/cuhkx/submission/validator.py", "src/cuhkx/submission/export.py",
     "configs/baseline.yaml", "configs/qwen35_4b.yaml", "configs/datasets.yaml", "configs/submission.yaml",
@@ -56,8 +62,11 @@ def collect(project: Path) -> dict[str, bytes]:
             raise ValueError(f"missing/unsafe package source: {relative}")
         payloads[PREFIX + relative] = path.read_bytes()
     payloads[PREFIX + "README.md"] = (
-        "# Qwen3.5-4B IR4 test lane\n\n"
+        "# Qwen3.5-4B IR4 vLLM test lane\n\n"
         "Independent model comparison. Use notebooks/qwen35-4b-test.ipynb.\n"
+        "Test inference runs on vLLM 0.24.0 with tensor parallelism across both\n"
+        "Kaggle T4 GPUs. This package is inference-only: it contains no training\n"
+        "stack and no model weights.\n"
         "The Qwen2.5-VL-7B baseline package and results are not included or modified.\n"
     ).encode("utf-8")
     source_manifest = json.loads((project / "data/asset_manifest.json").read_text(encoding="utf-8"))
@@ -90,6 +99,9 @@ def collect(project: Path) -> dict[str, bytes]:
         "model_revision": None,
         "transformers_version": "5.17.0",
         "training_included": False,
+        # Declared so the notebook can refuse a package built for another engine.
+        "inference_engine": INFERENCE_ENGINE,
+        "tensor_parallel_size": 2,
         "baseline_reference": "Qwen2.5-VL-7B IR4 baseline remains outside this package",
         "files": [{"path": name, "bytes": len(content),
                    "sha256": hashlib.sha256(content).hexdigest()}
@@ -147,7 +159,7 @@ def build(project: Path, output: Path, python: Path = Path(sys.executable), run_
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output", type=Path, default=PROJECT / "artifacts/cloud/qwen35_4b_test_v1.zip")
+    parser.add_argument("--output", type=Path, default=PROJECT / "artifacts/cloud" / ARCHIVE_NAME)
     parser.add_argument("--python", type=Path, default=Path(sys.executable))
     args = parser.parse_args()
     print(json.dumps(build(PROJECT, args.output, args.python), ensure_ascii=False, indent=2))

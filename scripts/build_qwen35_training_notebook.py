@@ -48,7 +48,7 @@ TENSOR_PARALLEL = 2    # vLLM 张量并行度：2×T4
 GPU_MEMORY_UTILIZATION = 0.80
 RUN_CONFIRMATION = False
 RUN_TEST = False
-PACKAGE_ID = "cuhkx-qwen35-4b-vllm-full-v1"
+PACKAGE_ID = "cuhkx-qwen35-4b-qlora-vllm-v1"
 MARKER = "qwen35_training_bundle_manifest.json"
 '''),
     cell("markdown", "## 1. 验证独立训练包并建立隔离工作目录"),
@@ -64,7 +64,7 @@ if BUNDLE_INPUT is None:
         except (OSError, ValueError):
             pass
     if not candidates:
-        candidates = list(INPUT.rglob("qwen35_4b.zip"))
+        candidates = list(INPUT.rglob("qwen35_4b_qlora.zip"))
     if len(candidates) != 1:
         raise RuntimeError(f"found {len(candidates)} matching training packages; set BUNDLE_INPUT")
     BUNDLE_INPUT = candidates[0]
@@ -299,11 +299,11 @@ CELLS[1]["source"] = CELLS[1]["source"].replace(
     "BUNDLE_INPUT = None\nEXPECTED_MANIFEST_SHA256 = None  # paste manifest_sha256 from the trusted package command",
 )
 CELLS[3]["source"] = secure_loader_source(
-    package_id="cuhkx-qwen35-4b-vllm-full-v1",
+    package_id="cuhkx-qwen35-4b-qlora-vllm-v1",
     identity_key="package_id",
     marker="qwen35_training_bundle_manifest.json",
     prefix="qwen35_training_repo/",
-    zip_name="qwen35_4b.zip",
+    zip_name="qwen35_4b_qlora.zip",
     runtime_prefix="qwen35_qlora_",
     repository_name="qwen35_training_repo",
     experiment=True,
@@ -319,7 +319,7 @@ if manifest.get("inference_engine") != "vllm_0.24.0_tensor_parallel":
 
 CELLS[0]["source"] = """# Qwen3.5-4B QLoRA: vLLM Dual-GPU
 
-This independent training notebook reuses the existing IR4 input protocol and embeds the complete five-fold cache. Create the package locally, copy its printed `manifest_sha256` into `EXPECTED_MANIFEST_SHA256` in the first code cell, and attach that exact `qwen35_4b.zip` as a private Kaggle input. This authenticates the manifest before any project code is copied or installed.
+This independent training notebook reuses the existing IR4 input protocol and embeds the complete five-fold cache. Create the package locally, copy its printed `manifest_sha256` into `EXPECTED_MANIFEST_SHA256` in the first code cell, and attach that exact `qwen35_4b_qlora.zip` as a private Kaggle input. This authenticates the manifest before any project code is copied or installed.
 
 Training and evaluation-under-training stay on Transformers, because vLLM is inference-only. Adapter reload checks, dev/confirm evaluation, and test inference run on **vLLM 0.24.0 with tensor parallelism across both T4 GPUs**. Both engines share the same data contract and constrained answer space, and the run contract records which engine produced each result.
 
@@ -327,8 +327,8 @@ The package contains no model weights. Use a Kaggle 2x T4 session; the notebook 
 """
 
 
-def build(output: Path):
-    if output.exists():
+def build(output: Path, *, force: bool = False):
+    if output.exists() and not force:
         raise FileExistsError(f"refusing to overwrite existing notebook: {output}")
     for index, item in enumerate(CELLS):
         if item["cell_type"] == "code":
@@ -350,4 +350,4 @@ if __name__ == "__main__":
     parser.add_argument("--force", action="store_true",
                         help="Regenerate the generated Qwen3.5 vLLM notebook")
     arguments = parser.parse_args()
-    build(arguments.output)
+    build(arguments.output, force=arguments.force)
