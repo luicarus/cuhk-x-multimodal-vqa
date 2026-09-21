@@ -56,6 +56,7 @@ flowchart LR
 
 - **确定性输入协议**：固定选帧、图像尺寸、prompt 版本和答案解析规则，保证模型对比只改变目标变量。
 - **多模型隔离**：Qwen2.5-VL-7B 与 Qwen3.5-4B 使用独立配置、依赖锁、Notebook、权重校验和运行目录。
+- **vLLM 双卡加速**：Qwen3.5-4B 的 adapter 重载、dev/confirm 评估与 test 推理在 2×T4 上以 vLLM 0.24.0 张量并行运行；训练仍走 Transformers，因为 vLLM 不支持训练。运行合同记录 `engine`，两种引擎的结果不会混用同一 run-id。
 - **可恢复执行**：推理和训练保存 contract、checkpoint、数据签名与环境信息，支持安全 `--resume`。
 - **严格 adapter 验证**：检查 LoRA target、基础模型 revision、权重有限性、非零更新和来源收据。
 - **防数据泄漏门禁**：先在 dev 选择候选，再运行 confirm；只有 confirm 提升后才生成 test submission。
@@ -69,7 +70,7 @@ flowchart LR
 | Qwen2.5-VL-7B baseline | [`cuhk-x-base7b.ipynb`](notebooks/cuhk-x-base7b.ipynb) | `artifacts/cloud/ir4_7b_v1.zip` |
 | Qwen2.5-VL-7B QLoRA | [`cuhk-x-qlora-full-v3.ipynb`](notebooks/cuhk-x-qlora-full-v3.ipynb) | `artifacts/cloud_training/cuhkx-ir4-qlora-full-v3.zip` |
 | Qwen3.5-4B baseline | [`qwen35-4b-test.ipynb`](notebooks/qwen35-4b-test.ipynb) | `artifacts/cloud/qwen35_4b_test_v1.zip` |
-| Qwen3.5-4B QLoRA | [`qwen35-4b-qlora-full-v1.ipynb`](notebooks/qwen35-4b-qlora-full-v1.ipynb) | `artifacts/cloud_training/qwen35_4b_qlora_full_v1.zip` |
+| Qwen3.5-4B QLoRA | [`qwen35-4b-qlora-vllm.ipynb`](notebooks/qwen35-4b-qlora-vllm.ipynb) | `artifacts/cloud_training/qwen35_4b.zip` |
 
 模型权重不提交到 Git。Notebook 可以下载固定 revision，或读取带来源收据的私有 Kaggle Input。ZIP 不提交到 Git，需由维护者通过 Kaggle Input 等渠道另行提供。运行预制包时，必须把与该 ZIP 对应的可信 `manifest_sha256` 填入 Notebook 的 `EXPECTED_MANIFEST_SHA256`；不要从 ZIP 自身读取期望值。
 
@@ -80,7 +81,7 @@ flowchart LR
 | `ir4_7b_v1.zip` | [`cuhk-x-base7b.ipynb`](notebooks/cuhk-x-base7b.ipynb) | `fff77f48080f294c36645f6a90315cfdd984eb295b5f2470e8581f4607db8f6a` |
 | `cuhkx-ir4-qlora-full-v3.zip` | [`cuhk-x-qlora-full-v3.ipynb`](notebooks/cuhk-x-qlora-full-v3.ipynb) | `08826da463ec22dbfa1fd6aa47bcf24e0bd10f8757aaf7a918a8dc19ca3d9fa9` |
 | `qwen35_4b_test_v1.zip` | [`qwen35-4b-test.ipynb`](notebooks/qwen35-4b-test.ipynb) | `0e2d1a6ef90c07a6b25645a169d35ddb1c9c87690e8f1855057f44082cda7661` |
-| `qwen35_4b_qlora_full_v1.zip` | [`qwen35-4b-qlora-full-v1.ipynb`](notebooks/qwen35-4b-qlora-full-v1.ipynb) | `f51e4652d36e491ba786ab5ee450dbca0d6ca4b66eaf88454302a3c2ee72746c` |
+| `qwen35_4b.zip` | [`qwen35-4b-qlora-vllm.ipynb`](notebooks/qwen35-4b-qlora-vllm.ipynb) | `abd7106fc7e2a67a878576799cc2de234ad15b3a66fa440ab671450c18d8b355` |
 
 ## 本地校验
 
@@ -119,12 +120,14 @@ tests/                    不污染工作区的 CPU 回归测试
 - [QLoRA 后训练设计](docs/post_training.md)
 - [完整训练包说明](docs/training_release.md)
 - [Qwen3.5-4B 对照](docs/qwen35_4b.md)
+- [Qwen3.5-4B vLLM 双卡后训练](docs/qwen35_training.md)
 - [Qwen3.5 Kaggle debugging 记录](docs/qwen35_debugging.md)
 
 ## 限制与说明
 
 - 仓库复用已完成的 EDA 和抽帧结果，不包含重新处理原始视频的主流程。
 - 本地环境无 GPU；GPU 推理和训练结果来自 Kaggle 云端运行。
+- vLLM 路径本地只做 CPU 契约与语法校验，双卡张量并行的真实吞吐与显存需在 2×T4 session 中实测。
 - 模型权重、竞赛原始数据和生成的 ZIP 不纳入 Git，使用时需遵守各自许可证与竞赛规则。
 - Kaggle 最终排名由竞赛方的私榜和后续评审决定，本仓库只记录可核对的提交分数。
 

@@ -1,4 +1,4 @@
-﻿"""Build the independent full-data Qwen3.5-4B QLoRA release."""
+"""Build the independent full-data Qwen3.5-4B QLoRA release (vLLM dual-GPU)."""
 from __future__ import annotations
 
 import argparse
@@ -16,10 +16,12 @@ PROJECT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT / "src"))
 from cuhkx.release_security import extract_verified_archive
 
-PACKAGE_ID = "cuhkx-qwen35-4b-qlora-full-v1"
+PACKAGE_ID = "cuhkx-qwen35-4b-vllm-full-v1"
 MANIFEST = "qwen35_training_bundle_manifest.json"
 PREFIX = "qwen35_training_repo/"
-NOTEBOOK = "notebooks/qwen35-4b-qlora-full-v1.ipynb"
+NOTEBOOK = "notebooks/qwen35-4b-qlora-vllm.ipynb"
+ARCHIVE_NAME = "qwen35_4b.zip"
+INFERENCE_ENGINE = "vllm_0.24.0_tensor_parallel"
 DATA_FILES = {
     "data/qa/test.csv", "data/qa/pilot.csv", "data/qa/sample_submission.csv",
     "data/references/pilot_answers.csv", "data/references/training_qa.csv",
@@ -36,6 +38,7 @@ FILES = (
     "src/cuhkx/data/__init__.py", "src/cuhkx/data/inputs.py", "src/cuhkx/data/validate.py",
     "src/cuhkx/inference/__init__.py", "src/cuhkx/inference/prompt.py", "src/cuhkx/inference/qwen.py",
     "src/cuhkx/inference/qwen35.py", "src/cuhkx/inference/qwen35_weights.py",
+    "src/cuhkx/inference/qwen35_vllm.py",
     "src/cuhkx/inference/runner.py", "src/cuhkx/inference/storage.py", "src/cuhkx/inference/weights.py",
     "src/cuhkx/evaluation/__init__.py", "src/cuhkx/evaluation/metric.py",
     "src/cuhkx/submission/__init__.py", "src/cuhkx/submission/validator.py", "src/cuhkx/submission/export.py",
@@ -93,14 +96,19 @@ def collect(project: Path):
               "files": [selected[name] for name in sorted(selected)]}
     payloads[PREFIX + "data/asset_manifest.json"] = encoded(assets)
     payloads[PREFIX + "README.md"] = (
-        "# Independent Qwen3.5-4B QLoRA release\n\n"
-        "Use notebooks/qwen35-4b-qlora-full-v1.ipynb. The package embeds the complete "
-        "five-fold IR8 cache and contains no model weights or raw videos.\n"
+        "# Independent Qwen3.5-4B QLoRA release (vLLM dual-GPU)\n\n"
+        f"Use {NOTEBOOK}. The package embeds the complete five-fold IR8 cache and "
+        "contains no model weights or raw videos. Adapter reload checks, dev/confirm "
+        "evaluation and test inference run on vLLM 0.24.0 with tensor parallelism "
+        "across both Kaggle T4 GPUs; training stays on Transformers.\n"
     ).encode("utf-8")
     manifest = {
         "schema_version": 1, "package_id": PACKAGE_ID,
         "model_id": "Qwen/Qwen3.5-4B", "model_revision": None,
         "training_cache_mode": "embedded_complete",
+        # Declared so the notebook can refuse a package built for another engine.
+        "inference_engine": INFERENCE_ENGINE,
+        "tensor_parallel_size": 2,
         "files": [{"path": name, "bytes": len(content),
                    "sha256": hashlib.sha256(content).hexdigest()}
                   for name, content in sorted(payloads.items())],
@@ -167,7 +175,7 @@ def build(project: Path, output: Path, python=sys.executable, run_checks=True):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path,
-                        default=PROJECT / "artifacts/cloud_training/qwen35_4b_qlora_full_v1.zip")
+                        default=PROJECT / "artifacts/cloud_training" / ARCHIVE_NAME)
     parser.add_argument("--python", type=Path, default=Path(sys.executable))
     parser.add_argument("--no-checks", action="store_true")
     args = parser.parse_args()

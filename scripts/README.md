@@ -9,5 +9,5 @@
 
 业务操作统一使用 CLI，原 baseline Notebook 不提供生成器或覆盖入口。
 
-- `package_qwen35_training.py`: builds the independent complete-data Qwen3.5-4B QLoRA package.
-- `build_qwen35_training_notebook.py`: builds its reproducible cloud Notebook.
+- `package_qwen35_training.py`: builds the independent complete-data Qwen3.5-4B QLoRA package as `artifacts/cloud_training/qwen35_4b.zip`, declaring `inference_engine: vllm_0.24.0_tensor_parallel`.
+- `build_qwen35_training_notebook.py`: builds its reproducible vLLM dual-GPU cloud Notebook, `notebooks/qwen35-4b-qlora-vllm.ipynb`.

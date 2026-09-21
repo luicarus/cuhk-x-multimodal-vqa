@@ -25,9 +25,13 @@ def evaluation_input(config, settings, split):
     return (targets,checked), samples
 
 
-def evaluate_training(config, settings, split, run_id, weights, adapter=None, resume=False):
+def evaluate_training(config, settings, split, run_id, weights, adapter=None, resume=False,
+                      backend=None, tensor_parallel_size=2, gpu_memory_utilization=0.80):
     prepared, samples = evaluation_input(config, settings, split)
     qwen35 = config["baseline"]["model"]["id"] == "Qwen/Qwen3.5-4B"
+    engine = backend or ("vllm" if qwen35 else "transformers")
+    require(engine in ("transformers", "vllm"), "unknown generation engine")
+    require(engine == "transformers" or qwen35, "vLLM is only wired for the Qwen3.5 lane")
     if qwen35:
         from cuhkx.inference.qwen35_weights import verify_qwen35_weights
         source = verify_qwen35_weights(weights, config["baseline"]["model"])
@@ -37,15 +41,26 @@ def evaluate_training(config, settings, split, run_id, weights, adapter=None, re
     if adapter is not None:
         source["adapter"] = verify_adapter(adapter, source)
     output = output_directory(config, run_id)
-    if qwen35:
+    if engine == "vllm":
+        from cuhkx.inference.qwen35_vllm import Qwen35VLLMBackend
+        backend_factory = lambda: Qwen35VLLMBackend(
+            config["baseline"], weights, adapter=adapter,
+            tensor_parallel_size=tensor_parallel_size,
+            gpu_memory_utilization=gpu_memory_utilization)
+        engine_options = {"tensor_parallel_size": tensor_parallel_size,
+                          "gpu_memory_utilization": gpu_memory_utilization}
+    elif qwen35:
         from cuhkx.inference.qwen35 import Qwen35Backend
         backend_factory = lambda: Qwen35Backend(config["baseline"], weights, adapter=adapter)
+        engine_options = {}
     else:
         from cuhkx.inference.qwen import QwenBackend
         backend_factory = lambda: QwenBackend(config["baseline"], weights, output / "offload", adapter=adapter)
+        engine_options = {}
     result = run_predictions(config, split, None, run_id, source,
         backend_factory,
-        resume=resume, prepared_input=prepared)
+        resume=resume, prepared_input=prepared,
+        engine=engine, engine_options=engine_options)
     if result["status"] != "PASS":
         return result
     with run_lock(output):

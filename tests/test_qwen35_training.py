@@ -41,22 +41,78 @@ def test_qwen35_train_lock_accepts_linux_markupsafe_wheel():
     assert "--index-url https://pypi.org/simple" in lock
     assert "--extra-index-url https://download.pytorch.org/whl/cu126" in lock
     assert "peft==0.18.0" in lock
-    assert "torchvision==0.22.1+cu126" in lock
+    # vLLM 0.24.0 pins the torch/torchvision pair and needs transformers>=5.5.3.
+    assert "torchvision==0.26.0+cu126" in lock
+    assert "torch==2.11.0+cu126" in lock
+    assert "vllm==0.24.0" in lock
     assert "-r qwen35.in" in (PROJECT / "requirements/train_qwen35.in").read_text(encoding="utf-8")
     start = lock.index("markupsafe==3.0.3")
     block = lock[start:lock.index("\nmdurl==", start)]
     assert "0bf2a864d67e76e5c9a34dc26ec616a66b9888e25e7b9460e1c76d3293bd9dbf" in block
 
 
+def test_qwen35_inference_lock_pairs_vllm_with_transformers_five():
+    lock = (PROJECT / "requirements/qwen35.lock.txt").read_text(encoding="utf-8")
+    for pin in ("vllm==0.24.0", "torch==2.11.0+cu126", "torchvision==0.26.0+cu126",
+                "transformers==5.17.0"):
+        assert pin in lock, pin
+    # The structured-output backends are what enforce the closed answer space.
+    assert "xgrammar==" in lock
+    # This lane must never drift into the 7B lane's Transformers 4.x toolchain.
+    baseline = (PROJECT / "requirements/cloud.lock.txt").read_text(encoding="utf-8")
+    assert "vllm==" not in baseline
+    assert "torch==2.7.1+cu126" in baseline
+
+
 def test_qwen35_training_notebook_keeps_cuda_package_index():
     import json
 
-    notebook = json.loads((PROJECT / "notebooks/qwen35-4b-qlora-full-v1.ipynb").read_text(encoding="utf-8"))
+    notebook = json.loads((PROJECT / "notebooks/qwen35-4b-qlora-vllm.ipynb").read_text(encoding="utf-8"))
     source = "\n".join(cell["source"] for cell in notebook["cells"] if cell["cell_type"] == "code")
     assert "--index-url" in source
     assert "https://download.pytorch.org/whl/cu126" in source
-    assert "import json, peft, transformers" in source
+    assert "import json, peft, transformers, vllm, torch" in source
     assert source.count('cloud("verify-run", "--profile", "qwen35", "--training-config", str(TRAINING_CONFIG)') == 3
+
+
+def test_qwen35_notebook_runs_vllm_on_two_gpus():
+    import json
+
+    notebook = json.loads((PROJECT / "notebooks/qwen35-4b-qlora-vllm.ipynb").read_text(encoding="utf-8"))
+    source = "\n".join(cell["source"] for cell in notebook["cells"] if cell["cell_type"] == "code")
+    # Dual-GPU tensor parallelism is the point of this lane.
+    assert 'TENSOR_PARALLEL = 2' in source
+    assert '"--backend", "vllm"' in source
+    assert '"--tensor-parallel-size", str(TENSOR_PARALLEL)' in source
+    # vLLM cannot train, so training must stay on the Transformers trainer.
+    training_calls = [line for line in source.splitlines() if 'cloud("train"' in line]
+    assert training_calls and all("vllm" not in line for line in training_calls)
+    # Both GPUs must be visible before vLLM starts.
+    assert "device_count" in source
+
+
+def test_qwen35_vllm_backend_keeps_the_constrained_answer_space():
+    source = (PROJECT / "src/cuhkx/inference/qwen35_vllm.py").read_text(encoding="utf-8")
+    # The reference backend constrains decoding with a prefix automaton; vLLM
+    # has no such hook and must constrain the same language via structured output.
+    assert "StructuredOutputsParams" in source
+    assert "choice=" in source
+    assert "enable_thinking" in source
+    assert "tensor_parallel_size" in source
+    # Two T4s have no NVLink, so eager mode and no custom all-reduce are required.
+    assert "enforce_eager=True" in source
+    assert "disable_custom_all_reduce=True" in source
+    assert "NCCL_P2P_DISABLE" in source
+
+
+def test_qwen35_vllm_is_not_shipped_to_the_baseline_lane():
+    # The 7B lane runs torch 2.7.1 + Transformers 4.57.6 and must never see vLLM.
+    for script in ("scripts/package_cloud.py", "scripts/package_training.py",
+                   "scripts/build_training_notebook.py"):
+        source = (PROJECT / script).read_text(encoding="utf-8")
+        assert "qwen35_vllm" not in source, script
+    training_lock = (PROJECT / "requirements/train.lock.txt").read_text(encoding="utf-8")
+    assert "vllm==" not in training_lock
 
 
 def test_qwen35_trainer_has_transformers_5_warmup_compatibility():

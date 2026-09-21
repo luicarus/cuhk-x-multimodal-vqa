@@ -5,7 +5,7 @@
 - `cloud.lock.txt`：Linux x86_64、Python 3.11、CUDA 12.6 的推理依赖及传递依赖，逐项固定版本和分发包哈希。
 - `.in` 文件记录直接依赖。lock 由 uv 0.12.6 根据包索引元数据解析生成；本轮没有在本机安装 CUDA 依赖。
 - `train.lock.txt`：在原 cloud lock 约束下解析的独立训练环境，只新增 PEFT 0.17.1；不修改已有推理锁。仅供云端训练环境安装，CPU 测试不需要它。
-- `qwen35.lock.txt`：Qwen3.5-4B test lane 的独立推理环境，固定 Transformers 5.17.0；不修改 7B baseline 的 cloud lock。
+- `qwen35.lock.txt`：Qwen3.5-4B lane 的独立推理环境，固定 Transformers 5.17.0 + vLLM 0.24.0 + torch 2.11.0；不修改 7B baseline 的 cloud lock。
 
 CPU 使用：`python -m pip install --require-hashes -r requirements/cpu.lock.txt`。
 云端在独立 Python 3.11 环境使用：`python -m pip install --require-hashes --only-binary=:all: -r requirements/cloud.lock.txt`。
@@ -24,4 +24,12 @@ uv pip compile requirements/cloud.in --python-version 3.11 --python-platform x86
 
 依赖解析成功不等于 GPU 已验收。真实驱动兼容性、bitsandbytes 加载、显存和推理速度仍需在云端验证。Notebook 使用独立环境，避免与平台预装 torchaudio 等包混装，并保存实际包列表与环境检查结果。
 
-- `train_qwen35.lock.txt`: independent Qwen3.5-4B QLoRA environment (Transformers 5.17.0 + PEFT).
+- `train_qwen35.lock.txt`: independent Qwen3.5-4B QLoRA environment (Transformers 5.17.0 + vLLM 0.24.0 + PEFT 0.18.0 + bitsandbytes 0.49.2).
+
+## vLLM 双卡说明
+
+vLLM 0.24.0 是第一个要求 `transformers>=5.5.3` 的版本，因此与本 lane 的 Transformers 5.17.0 兼容；它同时固定 `torch==2.11.0`，所以该 lane 从 2.7.1 升到 2.11.0+cu126 / torchvision 0.26.0+cu126。
+
+- **7B lane 不得安装 vLLM**：`cloud.lock.txt` / `train.lock.txt` 保持 torch 2.7.1 + Transformers 4.57.6，`package_cloud.py` 与 `package_training.py` 的白名单也不包含 `qwen35_vllm.py`。
+- `vllm` 在 PyPI 上只有 `cp38-abi3` wheel，可被 CPython 3.11 直接安装；`torch==2.11.0+cu126` 位于 PyTorch cu126 索引。
+- 结构化输出依赖 `xgrammar` / `outlines-core`，已包含在 qwen35 lock 中；这是 vLLM 实现答案空间约束的机制。

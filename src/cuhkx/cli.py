@@ -43,6 +43,61 @@ def prepare_run(config: dict, result: dict, run_id: str) -> Path:
     return output
 
 
+def add_inference_backend(command):
+    """Attach the generation-engine selector shared by predict/evaluate-training."""
+    command.add_argument("--backend", choices=("transformers", "vllm"), default=None,
+                         help="Generation engine. Defaults to vLLM for the Qwen3.5 lane "
+                              "and to Transformers for the Qwen2.5-VL-7B lane.")
+    command.add_argument("--tensor-parallel-size", type=int, default=2,
+                         help="vLLM tensor parallelism across visible GPUs (Kaggle 2x T4 default)")
+    command.add_argument("--gpu-memory-utilization", type=float, default=0.80,
+                         help="Fraction of each GPU vLLM may reserve")
+
+
+def default_backend(profile):
+    """vLLM is the accelerated default for the lane that ships it."""
+    return "vllm" if profile == "qwen35" else "transformers"
+
+
+def resolve_backend(args, profile):
+    """Pick the generation engine, rejecting combinations that cannot work."""
+    chosen = getattr(args, "backend", None) or default_backend(profile)
+    if chosen == "vllm":
+        require(profile == "qwen35",
+                "vLLM is only wired for the Qwen3.5 lane; the 7B lane uses NF4 on Transformers")
+        require(getattr(args, "adapter_dir", None) is None or profile == "qwen35",
+                "unsupported adapter/backend combination")
+    return chosen
+
+
+def engine_options(args, profile):
+    """Engine settings that must appear in the signed run contract."""
+    if resolve_backend(args, profile) != "vllm":
+        return {}
+    return {"tensor_parallel_size": args.tensor_parallel_size,
+            "gpu_memory_utilization": args.gpu_memory_utilization}
+
+
+def build_backend(profile, config, args, run_output):
+    """Construct the selected generation engine for one run."""
+    backend = resolve_backend(args, profile)
+    weights = args.weights_dir.resolve()
+    adapter = args.adapter_dir.resolve() if args.adapter_dir else None
+    if backend == "vllm":
+        from cuhkx.inference.qwen35_vllm import Qwen35VLLMBackend
+        return Qwen35VLLMBackend(
+            config["baseline"], weights, adapter=adapter,
+            tensor_parallel_size=args.tensor_parallel_size,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+        )
+    if profile == "qwen35":
+        from cuhkx.inference.qwen35 import Qwen35Backend
+        return Qwen35Backend(config["baseline"], weights, adapter=adapter)
+    from cuhkx.inference.qwen import QwenBackend
+    kwargs = {"adapter": adapter} if adapter is not None else {}
+    return QwenBackend(config["baseline"], weights, run_output / "offload", **kwargs)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     subcommands = parser.add_subparsers(dest="command", required=True)
@@ -64,6 +119,7 @@ def main(argv: list[str] | None = None) -> int:
     predict.add_argument("--resume", action="store_true")
     predict.add_argument("--adapter-dir", type=Path, help="Optional verified LoRA adapter; omitted for the baseline")
     predict.add_argument("--profile", choices=("baseline", "qwen35"), default="baseline")
+    add_inference_backend(predict)
     fetch = subcommands.add_parser("fetch-weights", help="Download pinned weights and record their content provenance")
     fetch.add_argument("--project-root", type=Path)
     fetch.add_argument("--data-root", type=Path)
@@ -89,6 +145,7 @@ def main(argv: list[str] | None = None) -> int:
         if name == "evaluate-training":
             command.add_argument("--split", choices=("dev", "confirm"), required=True)
             command.add_argument("--adapter-dir", type=Path)
+            add_inference_backend(command)
     for name, help_text in (("verify-run", "Verify a completed run without loading weights"),
                             ("evaluate", "Score a verified pilot run on CPU"),
                             ("submit", "Export a verified full test run; does not upload")):
@@ -130,7 +187,10 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 from cuhkx.training.evaluate import evaluate_training
                 result = evaluate_training(config,settings,args.split,args.run_id,args.weights_dir.resolve(),
-                                           adapter=args.adapter_dir,resume=args.resume)
+                                           adapter=args.adapter_dir,resume=args.resume,
+                                           backend=resolve_backend(args, profile),
+                                           tensor_parallel_size=args.tensor_parallel_size,
+                                           gpu_memory_utilization=args.gpu_memory_utilization)
             print(json.dumps(result,ensure_ascii=False,indent=2))
             return 0 if result["status"] == "PASS" else 2
         if args.command == "verify-run":
@@ -175,17 +235,12 @@ def main(argv: list[str] | None = None) -> int:
                     source["adapter"] = verify_adapter(args.adapter_dir, source)
 
             def backend_factory():
-                if profile == "qwen35":
-                    from cuhkx.inference.qwen35 import Qwen35Backend
-                    return Qwen35Backend(config["baseline"], args.weights_dir.resolve(),
-                                         adapter=args.adapter_dir.resolve() if args.adapter_dir else None)
-                from cuhkx.inference.qwen import QwenBackend
-                kwargs = {"adapter":args.adapter_dir.resolve()} if args.adapter_dir is not None else {}
-                return QwenBackend(config["baseline"], args.weights_dir.resolve(),
-                                   output_directory(config, args.run_id) / "offload", **kwargs)
+                return build_backend(profile, config, args, output_directory(config, args.run_id))
 
             result = run_predictions(config, args.dataset, args.limit, args.run_id, source,
-                                     backend_factory, resume=args.resume)
+                                     backend_factory, resume=args.resume,
+                                     engine=resolve_backend(args, profile),
+                                     engine_options=engine_options(args, profile))
             print(json.dumps({k: v for k, v in result.items() if k != "target_ids"}, ensure_ascii=False, indent=2))
             return 0 if result["status"] == "PASS" else 1
         result = check_inputs(config, args.dataset, args.limit)

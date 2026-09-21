@@ -28,6 +28,11 @@ def verify_completed_run(config, run_id, prepared_input=None):
     state = json.loads((output / "resume_state.json").read_text(encoding="utf-8"))
     contract = state["contract"]
     require(state["signature"] == fingerprint(contract), "run contract hash mismatch")
+    # Runs produced before the generation engine was part of the signed
+    # contract have no engine field. Read them as the Transformers engine they
+    # necessarily used, so previously recorded results stay verifiable.
+    contract.setdefault("engine", "transformers")
+    contract.setdefault("engine_options", {})
     dataset = contract["dataset"]
     if prepared_input is None:
         binding = config["datasets"]["datasets"][dataset]
@@ -43,6 +48,7 @@ def verify_completed_run(config, run_id, prepared_input=None):
     expected = {"schema_version": 1, "runner_version": 1, "execution_mode": contract["execution_mode"],
                 "baseline": config["baseline"], "model_source": contract["model_source"], "dataset": dataset,
                 "target_ids": checked["target_ids"], "input_signature": checked["input_signature"],
+                "engine": contract["engine"], "engine_options": contract["engine_options"],
                 "prompt_hashes": {q: fingerprint(p) for q, p in prompts.items()}}
     require(contract == expected, "current config/input differs from finished run")
     require(contract["execution_mode"] in ("cloud", "simulation"), "unknown execution mode")
@@ -121,13 +127,20 @@ def _verify_finished(output, summary, records, target_ids, signature):
 
 
 def run_predictions(config, dataset, limit, run_id, model_source, backend_factory, *, resume=False,
-                    execution_mode="cloud", fail_fast=True, prepared_input=None):
+                    execution_mode="cloud", fail_fast=True, prepared_input=None,
+                    engine="transformers", engine_options=None):
     """Factory is lazy: a complete verified run never loads a model.
 
     Production callers must verify_weights before passing model_source. CPU tests
     use execution_mode='simulation', which cannot resume as a cloud run.
+
+    ``engine`` and ``engine_options`` are part of the signed contract. Two runs
+    that differ only in generation engine -- for example Transformers versus
+    vLLM -- must never share a run signature, or a resumed run could silently
+    mix predictions produced by different engines.
     """
     require(execution_mode in ("cloud", "simulation"), "unknown execution mode")
+    require(isinstance(engine, str) and engine, "generation engine must be named")
     require(config["baseline"]["model"]["revision"] is not None, "model revision is not pinned")
     require(model_source["model_id"] == config["baseline"]["model"]["id"] and
             model_source["revision"] == config["baseline"]["model"]["revision"], "model source mismatch")
@@ -151,6 +164,7 @@ def run_predictions(config, dataset, limit, run_id, model_source, backend_factor
     contract = {"schema_version": 1, "runner_version": 1, "execution_mode": execution_mode,
                 "baseline": config["baseline"], "model_source": model_source, "dataset": dataset,
                 "target_ids": target_ids, "input_signature": checked["input_signature"],
+                "engine": engine, "engine_options": dict(engine_options or {}),
                 "prompt_hashes": {q: fingerprint(p) for q, p in prompts.items()}}
     signature = fingerprint(contract)
     output = output_directory(config, run_id)

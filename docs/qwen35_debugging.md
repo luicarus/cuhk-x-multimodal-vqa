@@ -1,6 +1,6 @@
 # Qwen3.5 Kaggle debugging 记录
 
-适用入口：`notebooks/qwen35-4b-qlora-full-v1.ipynb`。本文只记录本项目实际遇到并已修复的问题。
+适用入口：`notebooks/qwen35-4b-qlora-vllm.ipynb`。本文只记录本项目实际遇到并已修复的问题。
 
 ## 快速定位
 
@@ -18,6 +18,9 @@
 | `missing/non-finite LoRA gradients` | 自定义检查在 AMP `GradScaler` unscale 之前检查缩放梯度，把可恢复溢出当成失败 | 分开检查“梯度缺失”和“缩放溢出”；有 scaler 时让 AMP 决定跳步和降倍率 |
 | 四步均为 `grad_norm: nan`，最终 adapter 仍为零 | 默认 FP16 scale `65536` 过高，四个 optimizer step 全被跳过 | Qwen3.5 使用 `init_scale=1.0`、`growth_interval=16`；结束时仍严格验证 LoRA B 非零且指纹变化 |
 | `verify-run` 查找 `configs/training.yaml`，随后 confirm gate 失败 | Qwen3.5 Notebook 漏传训练配置，CLI 又采用 7B 默认路径 | 三处 `verify-run` 显式传入 `training_qwen35.yaml`；CLI 默认路径也改为按 profile 选择 |
+| vLLM 与固定环境冲突 | vLLM 0.24.0 要求 `transformers>=5.5.3` 并固定 `torch==2.11.0` | 本 lane 升到 `torch==2.11.0+cu126` / `torchvision==0.26.0+cu126` 并重新锁定；7B lane 保持 2.7.1 + Transformers 4.57.6，不安装 vLLM |
+| vLLM 对答案空间的约束与 Transformers 不一致 | vLLM 没有 `prefix_allowed_tokens_fn` 钩子 | 用 `StructuredOutputsParams(choice=[...])` 约束同一语言，并把每条答案固定为字面前缀；引擎启动前用参考 processor 校验 chat 渲染 |
+| 双 T4 上 vLLM 张量并行卡死或崩溃 | 两块 T4 无 NVLink，PCIe 上的 CUDA graph 捕获与 peer-to-peer 探测不稳定 | `enforce_eager=True`、`disable_custom_all_reduce=True`、`NCCL_P2P_DISABLE=1`，并用 `gpu_memory_utilization=0.80` 给 KV cache 留边界 |
 
 7B adapter 重载还遇到过 PEFT 将完整 target path 压缩成 `q_proj`/`v_proj` 后 provenance 校验失败。当前校验接受这种等价序列化，同时仍拒绝扩大的 target 范围。
 
@@ -48,13 +51,20 @@ CONFIRMED = accuracy("qwen35_pt_adapter_confirm") > accuracy("qwen35_pt_base_con
 
 不要在保留现有训练结果的 Session 中途更换 ZIP。新 ZIP 的清单哈希会创建新的 `RUNTIME`，原运行结果仍在旧目录。
 
+## vLLM 双卡相关提示
+
+- vLLM 只做推理。Notebook 中的 `cloud("train", ...)` 不带 `--backend vllm`；训练仍由 Transformers 完成。
+- 首次加载 vLLM 需要编译 kernel，耗时明显长于后续调用，属正常现象。
+- `VLLM_USE_FLASHINFER_SAMPLER=0`：关闭 FlashInfer sampler，避免在 T4 上额外的 JIT 依赖。
+- 若 workspace 只读，`TRITON_CACHE_DIR` / `TORCHINDUCTOR_CACHE_DIR` 已指向 `/tmp`。
+
 ## 修复后的最小验证
 
 每次改动后只需按影响范围验证：
 
 1. 运行 `tests/test_qwen35_training.py`。
 2. 重新生成 Notebook，并确认所有代码 Cell 可编译。
-3. 重新打包 ZIP，检查 14,832 个文件及 test、pilot、五折训练缓存。
-4. GPU 相关修复在 Kaggle 先跑四步 smoke，再开始完整 SFT。
+3. 重新打包 ZIP，检查 14,835 个文件及 test、pilot、五折训练缓存。
+4. GPU 相关修复在 Kaggle 先跑四步 smoke 与 vLLM TP=2 短跑，再开始完整 SFT。
 
 成功训练至少应满足：训练 loss 有限、出现真实 optimizer 更新、LoRA B 非零、adapter 可重载。当前已记录的 dev 结果为 baseline `0.4466667`、adapter `0.5413333`，来源为用户完成的 Kaggle 运行。
