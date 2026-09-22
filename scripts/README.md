@@ -36,7 +36,11 @@ python scripts/bench_report.py --json reports/bench.json          # 另存机器
 
 **关于 TTFT 的口径**：只对**真正上报了首 token 时间戳的请求**求平均，缺失的请求被排除而不是记为 0（记为 0 会得出虚高的漂亮数字），同时输出 `coverage` 说明覆盖率。在本 workload 下（`max_new_tokens=8`，答案 1~4 个 token）prefill 几乎就是全部，**TTFT 预期接近总延迟**——报告如实呈现，不假装是聊天场景的 profile。
 
+> vLLM 的 `LLM` 会在调用方未显式传入时**强制 `disable_log_stats=True`**，此时 output processor 把 `RequestStateStats` 置为 `None`，**`first_token_latency` 根本不会产生**。因此本后端显式传 `disable_log_stats=False`；`VLLM_NO_USAGE_STATS` 只关闭远端上报，与引擎统计无关。
+
 **关于显存**：同时记录驱动视角（`mem_get_info`，决定还能不能开大 batch）与分配器视角（`allocated` / `reserved`，两者差距大意味着碎片而非真缺显存，修法不同）。**逐卡记录**是因为 TP 下两卡不一定均衡，只看总量会掩盖不均衡。
+
+> vLLM 的引擎与每个 TP rank 跑在**独立进程**里，从父进程读 `torch.cuda.memory_allocated()` **恒为 0**——只有驱动视角能跨进程。因此 worker 侧显存通过 `collective_rpc` **在 worker 进程内**采样，KV cache 大小（`available_kv_cache_memory_bytes`、`num_gpu_blocks × block_size`）也从 worker 取，因为引擎在自身 profiling 阶段算出后并不暴露给 `LLM` 对象。
 
 引擎侧指标（TTFT、token 数）通过 `backend.last_metrics` 传递；后端不上报时视为「无数据」而非 0。显存采样失败会被吞掉并返回空字典——**profiling 永远不能成为预测失败的原因**。
 

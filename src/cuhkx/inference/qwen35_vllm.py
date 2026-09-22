@@ -187,6 +187,13 @@ class Qwen35VLLMBackend:
             disable_custom_all_reduce=True,
             max_num_seqs=1,
             attention_config={"backend": attention_backend},
+            # LLM.__init__ forces disable_log_stats=True when the caller does not
+            # pass it, and the output processor then attaches RequestStateStats
+            # only when log_stats is on. Without this the finished output carries
+            # metrics=None, which is why an earlier run reported no TTFT at all:
+            # first_token_latency simply is not produced. Engine statistics are
+            # per-iteration aggregates, so the cost is negligible.
+            disable_log_stats=False,
             # A LoRA adapter needs the LoRA path compiled into the engine.
             enable_lora=adapter is not None,
             max_loras=1,
@@ -266,12 +273,27 @@ class Qwen35VLLMBackend:
         self.last_metrics = _engine_metrics(output)
         return output.outputs[0].text.strip()
 
+    def worker_memory(self):
+        """Per-worker GPU memory, sampled inside each vLLM worker process.
+
+        Returns ``{"workers": [...], "error": None}``. A worker that has already
+        exited, or a failure inside the RPC, is reported as an error string
+        rather than raised: telemetry must never fail a prediction run.
+        """
+        try:
+            results = self.engine.collective_rpc(_worker_telemetry)
+        except Exception as error:              # noqa: BLE001 - telemetry only
+            return {"workers": [], "error": f"{type(error).__name__}: {error}"}
+        return {"workers": list(results), "error": None}
+
     def metadata(self):
         import os
 
         runtime = {name: importlib.metadata.version(name)
                    for name in ("torch", "transformers", "vllm")
                    if _installed(name)}
+        # Sampled here, while the engine is still alive: the workers hold the
+        # model and KV cache, and they are gone once the object is released.
         return {
             "backend": "qwen35_4b_vllm",
             "model_class": type(self.engine).__name__,
@@ -283,6 +305,7 @@ class Qwen35VLLMBackend:
             "answer_constraint": "structured_outputs_choice",
             "lora_adapter": self.adapter_request.lora_name if self.adapter_request else None,
             "load_seconds": self.load_seconds,
+            "workers": self.worker_memory(),
             "image_encode_ms_last": round(getattr(self, "last_encode_seconds", 0.0) * 1000.0, 3),
             "versions": runtime,
             "engine_environment": {name: os.environ.get(name) for name in VLLM_ENGINE_ENV},
@@ -309,6 +332,51 @@ def _engine_metrics(output) -> dict:
     if not values:
         return {"reported": False}
     return {"reported": True, **values}
+
+
+def _worker_telemetry(worker):
+    """Run inside a vLLM worker process and report that worker's GPU memory.
+
+    This must execute in the worker, not the parent: vLLM runs the engine and
+    each tensor-parallel rank in separate processes, so torch's allocator
+    counters read from the parent are always zero. Only the driver view
+    (mem_get_info) crosses process boundaries, which is why an earlier version
+    of this reported `used_mib` correctly but `allocated_mib: 0`.
+
+    KV cache figures come from the worker too, since the engine computes them
+    during its own profiling pass and never exposes them on the LLM object.
+
+    Returns plain Python types only -- the result is pickled back across the
+    process boundary, and large tensors must never be returned.
+    """
+    import torch
+
+    index = torch.cuda.current_device()
+    free_bytes, total_bytes = torch.cuda.mem_get_info(index)
+    report = {
+        "device_index": index,
+        "device_name": torch.cuda.get_device_name(index),
+        "total_mib": round(total_bytes / 1024**2, 1),
+        "free_mib": round(free_bytes / 1024**2, 1),
+        "used_mib": round((total_bytes - free_bytes) / 1024**2, 1),
+        "allocated_mib": round(torch.cuda.memory_allocated(index) / 1024**2, 1),
+        "reserved_mib": round(torch.cuda.memory_reserved(index) / 1024**2, 1),
+        "peak_allocated_mib": round(torch.cuda.max_memory_allocated(index) / 1024**2, 1),
+        "peak_reserved_mib": round(torch.cuda.max_memory_reserved(index) / 1024**2, 1),
+    }
+    # Present only after profiling has run; absent on a worker that never
+    # finished initialization, which is reported as a missing key on purpose.
+    available = getattr(worker, "available_kv_cache_memory_bytes", None)
+    if available is not None:
+        report["kv_cache_mib"] = round(int(available) / 1024**2, 1)
+    cache_config = getattr(worker, "cache_config", None)
+    blocks = getattr(cache_config, "num_gpu_blocks", None)
+    if blocks:
+        report["kv_cache_blocks"] = int(blocks)
+        block_size = getattr(cache_config, "block_size", None)
+        if block_size:
+            report["kv_cache_tokens"] = int(blocks) * int(block_size)
+    return report
 
 
 def _installed(name: str) -> bool:

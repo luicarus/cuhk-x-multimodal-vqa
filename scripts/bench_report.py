@@ -72,6 +72,7 @@ def load_run(outputs: Path, run_id: str) -> dict:
         "engine": contract.get("engine") or summary.get("engine") or "transformers",
         "engine_options": contract.get("engine_options") or summary.get("engine_options") or {},
         "backend": backend.get("backend", "?"),
+        "backend_metadata": backend,
         "dataset": contract.get("dataset") or "?",
         "requests": len(targets),
         "executed": executed,
@@ -240,7 +241,7 @@ def main() -> int:
 
     memory_runs = [run for run in runs if (run.get("gpu_memory") or {}).get("after")]
     if memory_runs:
-        print("\ngpu memory per device (MiB), sampled while the engine was resident")
+        print("\ngpu memory per device (MiB), sampled from the parent process")
         print(f"{'run':<22} {'dev':>4} {'name':<16} {'total':>9} {'used':>9} {'free':>9} "
               f"{'alloc':>9} {'reserved':>9} {'peak_alloc':>11}")
         print("-" * 112)
@@ -258,6 +259,26 @@ def main() -> int:
                 deltas = [f"dev{d}: {before[d]['used_mib']:.0f}->{memory['after'][d]['used_mib']:.0f} MiB"
                           for d in sorted(before) if d in memory["after"]]
                 print(f"{'':<22} growth during run: {'; '.join(deltas)}")
+
+    worker_runs = [run for run in runs
+                   if ((run.get("backend_metadata") or {}).get("workers") or {}).get("workers")]
+    if worker_runs:
+        print("\ngpu memory per vLLM worker process (MiB), sampled inside each worker")
+        print(f"{'run':<22} {'dev':>4} {'used':>9} {'free':>9} {'alloc':>9} {'reserved':>9} "
+              f"{'peak_alloc':>11} {'kv_cache':>10} {'kv_tokens':>10}")
+        print("-" * 112)
+        for run in worker_runs:
+            for worker in run["backend_metadata"]["workers"]["workers"]:
+                print(f"{run['run_id']:<22} {worker.get('device_index', '?'):>4} "
+                      f"{_fmt(worker.get('used_mib'), 9, 1)} {_fmt(worker.get('free_mib'), 9, 1)} "
+                      f"{_fmt(worker.get('allocated_mib'), 9, 1)} "
+                      f"{_fmt(worker.get('reserved_mib'), 9, 1)} "
+                      f"{_fmt(worker.get('peak_allocated_mib'), 11, 1)} "
+                      f"{_fmt(worker.get('kv_cache_mib'), 10, 1)} "
+                      f"{_fmt(worker.get('kv_cache_tokens'), 10)}")
+            error = run["backend_metadata"]["workers"].get("error")
+            if error:
+                print(f"{'':<22} worker telemetry error: {error}")
 
     if args.baseline:
         base = next((run for run in runs if run["run_id"] == args.baseline), None)
@@ -285,7 +306,8 @@ def main() -> int:
 
     if args.json:
         args.json.parent.mkdir(parents=True, exist_ok=True)
-        payload = [{key: value for key, value in run.items() if key != "predictions"}
+        skip = {"predictions", "backend_metadata"}
+        payload = [{key: value for key, value in run.items() if key not in skip}
                    for run in runs]
         args.json.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
                              encoding="utf-8")

@@ -226,6 +226,171 @@ def test_qwen35_vllm_defaults_to_triton_attention():
     assert "cannot find -lcuda" in source
 
 
+def test_qwen35_vllm_enables_engine_stats_for_ttft():
+    """LLM forces disable_log_stats=True unless the caller overrides it.
+
+    The output processor then sets RequestStateStats to None, so the finished
+    output carries metrics=None and first_token_latency is never produced. A run
+    with this unset reported no TTFT at all, which is the symptom this guards.
+    """
+    source = (PROJECT / "src/cuhkx/inference/qwen35_vllm.py").read_text(encoding="utf-8")
+    assert "disable_log_stats=False" in source
+    # VLLM_NO_USAGE_STATS only silences the remote usage reporter.
+    assert '"VLLM_NO_USAGE_STATS"' in source
+
+
+def test_qwen35_vllm_samples_memory_inside_worker_processes():
+    """Parent-process allocator counters are always zero under vLLM.
+
+    The engine and each tensor-parallel rank run in separate processes, so
+    torch.cuda.memory_allocated() read from the parent returns 0. An earlier
+    version reported used_mib correctly but allocated_mib 0 for this reason.
+    """
+    source = (PROJECT / "src/cuhkx/inference/qwen35_vllm.py").read_text(encoding="utf-8")
+    assert "collective_rpc" in source
+    assert "def _worker_telemetry(worker)" in source
+    # The worker function must read its own device, not an inherited one.
+    assert "torch.cuda.current_device()" in source
+    assert "available_kv_cache_memory_bytes" in source
+    assert "num_gpu_blocks" in source
+
+
+def test_qwen35_vllm_telemetry_failure_never_raises():
+    """Telemetry is diagnostic; it must not be able to fail a prediction run."""
+    from cuhkx.inference.qwen35_vllm import Qwen35VLLMBackend
+
+    class BrokenEngine:
+        def collective_rpc(self, method, *args, **kwargs):
+            raise RuntimeError("worker died")
+
+    backend = Qwen35VLLMBackend.__new__(Qwen35VLLMBackend)
+    backend.engine = BrokenEngine()
+
+    result = backend.worker_memory()
+    assert result["workers"] == []
+    assert "worker died" in result["error"]
+
+
+def test_qwen35_vllm_worker_telemetry_returns_plain_types():
+    """The result is pickled across a process boundary, so no tensors."""
+    from cuhkx.inference.qwen35_vllm import _worker_telemetry
+
+    class FakeCuda:
+        @staticmethod
+        def current_device():
+            return 0
+
+        @staticmethod
+        def get_device_name(index):
+            return "Tesla T4"
+
+        @staticmethod
+        def mem_get_info(index):
+            return (4 * 1024**3, 16 * 1024**3)
+
+        @staticmethod
+        def memory_allocated(index):
+            return 1024**3
+
+        @staticmethod
+        def memory_reserved(index):
+            return 2 * 1024**3
+
+        @staticmethod
+        def max_memory_allocated(index):
+            return 3 * 1024**3
+
+        @staticmethod
+        def max_memory_reserved(index):
+            return 4 * 1024**3
+
+    class FakeTorch:
+        cuda = FakeCuda()
+
+    class CacheConfig:
+        num_gpu_blocks = 1000
+        block_size = 528
+
+    class Worker:
+        available_kv_cache_memory_bytes = 5 * 1024**3
+        cache_config = CacheConfig()
+
+    import sys
+    original = sys.modules.get("torch")
+    sys.modules["torch"] = FakeTorch()
+    try:
+        report = _worker_telemetry(Worker())
+    finally:
+        if original is None:
+            sys.modules.pop("torch", None)
+        else:
+            sys.modules["torch"] = original
+
+    assert report["device_index"] == 0
+    assert report["used_mib"] == 12288.0
+    assert report["allocated_mib"] == 1024.0
+    assert report["kv_cache_mib"] == 5120.0
+    assert report["kv_cache_blocks"] == 1000
+    assert report["kv_cache_tokens"] == 1000 * 528
+    # Everything must be JSON-serializable.
+    import json
+    json.dumps(report)
+
+
+def test_qwen35_vllm_worker_telemetry_omits_missing_kv_cache():
+    """A worker that never finished profiling reports memory without KV cache."""
+    from cuhkx.inference.qwen35_vllm import _worker_telemetry
+
+    class FakeCuda:
+        @staticmethod
+        def current_device():
+            return 0
+
+        @staticmethod
+        def get_device_name(index):
+            return "Tesla T4"
+
+        @staticmethod
+        def mem_get_info(index):
+            return (1 * 1024**3, 16 * 1024**3)
+
+        @staticmethod
+        def memory_allocated(index):
+            return 0
+
+        @staticmethod
+        def memory_reserved(index):
+            return 0
+
+        @staticmethod
+        def max_memory_allocated(index):
+            return 0
+
+        @staticmethod
+        def max_memory_reserved(index):
+            return 0
+
+    class FakeTorch:
+        cuda = FakeCuda()
+
+    class Bare:
+        pass
+
+    import sys
+    original = sys.modules.get("torch")
+    sys.modules["torch"] = FakeTorch()
+    try:
+        report = _worker_telemetry(Bare())
+    finally:
+        if original is None:
+            sys.modules.pop("torch", None)
+        else:
+            sys.modules["torch"] = original
+
+    assert "kv_cache_mib" not in report
+    assert "kv_cache_tokens" not in report
+
+
 def test_qwen35_notebooks_pin_the_attention_backend():
     import json
 
