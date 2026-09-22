@@ -14,6 +14,7 @@ from cuhkx.config import inside, require
 from cuhkx.data.inputs import load_qa, pending_targets, select_targets
 from cuhkx.data.validate import check_inputs, fingerprint, sha256
 from cuhkx.evaluation.metric import available_option_letters
+from cuhkx.inference.profiling import RequestTimer
 from cuhkx.inference.prompt import (PROMPT_VERSION, allowed_answer_outputs, build_mcq_prompt,
                                     detect_prompt_leakage, parse_model_answer)
 from cuhkx.inference.storage import atomic_write, run_lock, write_json
@@ -202,18 +203,25 @@ def run_predictions(config, dataset, limit, run_id, model_source, backend_factor
         run_error = None
         if pending:
             backend = backend_factory()
+        timer = RequestTimer()
         for qa in pending:
             qa_id = qa["qa_id"]
             images = []
             raw, prediction, error, status = "", None, None, "failed"
+            request_started = time.perf_counter()
+            image_ms = generate_ms = 0.0
             try:
+                phase_started = time.perf_counter()
                 for relative in checked["selected_frames"][qa_id]:
                     with Image.open(inside(data, relative)) as image:
                         image.load()
                         images.append(image.copy())
+                image_ms = (time.perf_counter() - phase_started) * 1000.0
+                phase_started = time.perf_counter()
                 raw = backend.generate(images, prompts[qa_id],
                     allowed_outputs=allowed_answer_outputs(qa["category"], available_option_letters(qa)),
                     max_new_tokens=config["baseline"]["generation"]["max_new_tokens"])
+                generate_ms = (time.perf_counter() - phase_started) * 1000.0
                 require(isinstance(raw, str), "backend output must be text")
                 parsed = parse_model_answer(raw, category=qa["category"], valid_options=available_option_letters(qa))
                 if parsed.is_valid and raw in allowed_answer_outputs(qa["category"], available_option_letters(qa)):
@@ -234,6 +242,10 @@ def run_predictions(config, dataset, limit, run_id, model_source, backend_factor
             records[qa_id] = record
             ordered = [records[q] for q in target_ids if q in records]
             atomic_write(output / "checkpoint.jsonl", _jsonl(ordered))
+            # Recorded after the checkpoint write so total_ms covers the full
+            # per-request cost, including the O(n) rewrite of checkpoint.jsonl.
+            timer.record(qa_id, total_ms=(time.perf_counter() - request_started) * 1000.0,
+                         image_ms=image_ms, generate_ms=generate_ms, status=status)
             print(f"{qa_id}: {status} ({sum(r['status'] == 'valid' for r in records.values())}/{len(targets)} valid)", flush=True)
             if status != "valid" and fail_fast:
                 break
@@ -246,6 +258,10 @@ def run_predictions(config, dataset, limit, run_id, model_source, backend_factor
         summary = {"status": "PASS" if counts["valid"] == len(targets) else "FAIL",
                    "execution_mode": execution_mode, "signature": signature, "target_ids": target_ids,
                    "counts": counts, "resumed_valid": len(completed), "elapsed_seconds": time.perf_counter() - started,
+                   # Timing is advisory evidence, not part of the verified
+                   # contract: _verify_finished never reads it, so a metric change
+                   # cannot invalidate an already finished run.
+                   "latency": timer.summary(),
                    "backend": backend.metadata() if backend else {"loaded_this_run": False}, "error": run_error,
                    "output_sha256": {name: sha256(output / name) for name in ARTIFACTS}}
         write_json(summary_path, summary)

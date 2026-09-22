@@ -63,6 +63,40 @@ def test_complete_resume_and_exact_images(project):
     assert resumed == result
 
 
+def test_run_records_per_request_latency(project):
+    """Every executed request must contribute a timing sample.
+
+    The numbers drive the infra comparison, so a run that silently reported no
+    timing would make the bench table read as "not measured" with no clue why.
+    """
+    config, source = setup_run(project)
+    backend = FakeBackend(["A", "B"])
+    result = run(config, source, backend)
+
+    latency = result["latency"]
+    assert latency["requests"] == 2
+    assert latency["warmup_skipped"] == 0
+    for phase in ("total_ms", "image_ms", "generate_ms", "overhead_ms"):
+        assert latency["latency_ms"][phase]["count"] == 2, phase
+    assert latency["latency_ms"]["total_ms"]["mean_ms"] > 0
+    # Phases must not exceed the request they came from.
+    assert latency["latency_ms"]["total_ms"]["min_ms"] >= (
+        latency["latency_ms"]["generate_ms"]["min_ms"])
+    assert result["latency"]["steady_state_valid_rate"] == 1.0
+    assert result["latency"]["steady_state_throughput_rps"] > 0
+
+
+def test_latency_survives_a_failed_request(project):
+    """A backend error must still produce a sample, or throughput reads high."""
+    config, source = setup_run(project)
+    backend = FakeBackend([RuntimeError("boom")])
+    result = run(config, source, backend, fail_fast=True)
+
+    assert result["status"] == "FAIL"
+    assert result["latency"]["requests"] == 1
+    assert result["latency"]["steady_state_valid_rate"] == 0.0
+
+
 def test_interruption_and_stable_limit(project):
     config, source = setup_run(project)
     backend = FakeBackend(["A", KeyboardInterrupt()])

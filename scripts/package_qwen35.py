@@ -31,6 +31,7 @@ CODE_FILES = (
     "src/cuhkx/inference/__init__.py", "src/cuhkx/inference/prompt.py", "src/cuhkx/inference/qwen35.py",
     "src/cuhkx/inference/qwen35_vllm.py", "src/cuhkx/inference/qwen35_weights.py",
     "src/cuhkx/inference/runner.py", "src/cuhkx/inference/storage.py",
+    "src/cuhkx/inference/profiling.py",
     "src/cuhkx/evaluation/__init__.py", "src/cuhkx/evaluation/metric.py",
     "src/cuhkx/submission/__init__.py", "src/cuhkx/submission/validator.py", "src/cuhkx/submission/export.py",
     "configs/baseline.yaml", "configs/qwen35_4b.yaml", "configs/datasets.yaml", "configs/submission.yaml",

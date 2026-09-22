@@ -221,9 +221,15 @@ class Qwen35VLLMBackend:
         require(max_new_tokens >= max(len(value) for value in outputs),
                 "max_new_tokens cannot cover the answer space")
 
+        # Encoding four frames to PNG data URIs is pure CPU work on the request
+        # path. It is measured separately because at batch=1 it can be a visible
+        # share of the wall clock, and it is the first thing to move off the
+        # critical path when batching.
+        encode_started = time.perf_counter()
         content = [{"type": "image_url",
                     "image_url": {"url": _data_uri(image), "detail": "high"}}
                    for image in images]
+        self.last_encode_seconds = time.perf_counter() - encode_started
         content.append({"type": "text", "text": prompt})
         messages = [{"role": "user", "content": content}]
 
@@ -268,6 +274,7 @@ class Qwen35VLLMBackend:
             "answer_constraint": "structured_outputs_choice",
             "lora_adapter": self.adapter_request.lora_name if self.adapter_request else None,
             "load_seconds": self.load_seconds,
+            "image_encode_ms_last": round(getattr(self, "last_encode_seconds", 0.0) * 1000.0, 3),
             "versions": runtime,
             "engine_environment": {name: os.environ.get(name) for name in VLLM_ENGINE_ENV},
         }
