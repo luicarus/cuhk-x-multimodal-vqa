@@ -21,7 +21,7 @@ MANIFEST = "qwen35_training_bundle_manifest.json"
 PREFIX = "qwen35_training_repo/"
 NOTEBOOK = "notebooks/qwen35-4b-qlora-vllm.ipynb"
 ARCHIVE_NAME = "qwen35_4b_qlora.zip"
-INFERENCE_ENGINE = "vllm_0.21.0_tensor_parallel"
+INFERENCE_ENGINE = "vllm_0.19.1_tensor_parallel"
 DATA_FILES = {
     "data/qa/test.csv", "data/qa/pilot.csv", "data/qa/sample_submission.csv",
     "data/references/pilot_answers.csv", "data/references/training_qa.csv",
@@ -99,7 +99,7 @@ def collect(project: Path):
         "# Independent Qwen3.5-4B QLoRA release (vLLM dual-GPU)\n\n"
         f"Use {NOTEBOOK}. The package embeds the complete five-fold IR8 cache and "
         "contains no model weights or raw videos. Adapter reload checks, dev/confirm "
-        "evaluation and test inference run on vLLM 0.21.0 with tensor parallelism "
+        "evaluation and test inference run on vLLM 0.19.1 with tensor parallelism "
         "across both Kaggle T4 GPUs; training stays on Transformers.\n"
     ).encode("utf-8")
     manifest = {

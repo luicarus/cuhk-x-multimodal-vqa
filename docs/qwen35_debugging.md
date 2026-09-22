@@ -11,16 +11,24 @@
 | 现象 | 原因 | 当前修复 |
 |---|---|---|
 | `markupsafe==3.0.3` 哈希不匹配 | 锁文件只记录了另一平台的 wheel 哈希 | 训练锁按 Python 3.11 Linux wheel 生成，并保留 Kaggle manylinux 哈希 |
-| 找不到 `torch==2.7.1+cu126` | pip 只查询 PyPI，CUDA 本地版本位于 PyTorch 索引 | 锁文件和安装命令同时声明 PyPI 与 `https://download.pytorch.org/whl/cu126` |
+| 找不到 `torch==2.7.1+cu128` | pip 只查询 PyPI，CUDA 本地版本位于 PyTorch 索引 | 锁文件和安装命令同时声明 PyPI 与 `https://download.pytorch.org/whl/cu128` |
 | PEFT 与模型/Transformers 不兼容 | 初版使用 `peft==0.17.1` | 固定为 `peft==0.18.0`，并与 Transformers 5.17.0 一起锁定 |
-| `Qwen3VLVideoProcessor requires Torchvision` | 训练依赖没有继承 Qwen3.5 视觉运行依赖 | `train_qwen35.in` 引用 `qwen35.in`，固定 `torchvision==0.22.1+cu126` |
+| `Qwen3VLVideoProcessor requires Torchvision` | 训练依赖没有继承 Qwen3.5 视觉运行依赖 | `train_qwen35.in` 引用 `qwen35.in`，固定 `torchvision==0.22.1+cu128` |
 | `TrainingArguments` 拒绝 warmup 参数 | Transformers 5 的参数名与旧版本不同 | 运行时检查 `TrainingArguments` 签名，选择 `warmup_ratio` 或 `warmup_steps` |
 | `missing/non-finite LoRA gradients` | 自定义检查在 AMP `GradScaler` unscale 之前检查缩放梯度，把可恢复溢出当成失败 | 分开检查“梯度缺失”和“缩放溢出”；有 scaler 时让 AMP 决定跳步和降倍率 |
 | 四步均为 `grad_norm: nan`，最终 adapter 仍为零 | 默认 FP16 scale `65536` 过高，四个 optimizer step 全被跳过 | Qwen3.5 使用 `init_scale=1.0`、`growth_interval=16`；结束时仍严格验证 LoRA B 非零且指纹变化 |
 | `verify-run` 查找 `configs/training.yaml`，随后 confirm gate 失败 | Qwen3.5 Notebook 漏传训练配置，CLI 又采用 7B 默认路径 | 三处 `verify-run` 显式传入 `training_qwen35.yaml`；CLI 默认路径也改为按 profile 选择 |
-| vLLM 与固定环境冲突 | vLLM 0.21.0 要求 `transformers>=5.5.3` 并固定 `torch==2.11.0` | 本 lane 升到 `torch==2.11.0+cu126` / `torchvision==0.26.0+cu126` 并重新锁定；7B lane 保持 2.7.1 + Transformers 4.57.6，不安装 vLLM |
+| vLLM 与固定环境冲突 | vLLM 0.19.1 要求 `transformers>=4.56` 并固定 `torch==2.10.0` | 本 lane 用 `torch==2.10.0+cu128` / `torchvision==0.25.0+cu128` 匹配宿主 CUDA 12.8；7B lane 保持 2.7.1 + Transformers 4.57.6，不安装 vLLM |
+| `ImportError: libcudart.so.13` | vLLM 0.20+ 的预编译 wheel 链接 CUDA 13，宿主只有 libcudart.so.12 | 降到 0.19.1（最后一个链接 `libcudart.so.12` 的版本）；**必须读 wheel 里 `.so` 的 `DT_NEEDED`，不能只看 metadata** |
+| `libcuda.so.13: cannot open shared object file` | 同上，只是 `.so` 名称不同 | 同上 |
 | vLLM 对答案空间的约束与 Transformers 不一致 | vLLM 没有 `prefix_allowed_tokens_fn` 钩子 | 用 `StructuredOutputsParams(choice=[...])` 约束同一语言，并把每条答案固定为字面前缀；引擎启动前用参考 processor 校验 chat 渲染 |
 | 双 T4 上 vLLM 张量并行卡死或崩溃 | 两块 T4 无 NVLink，PCIe 上的 CUDA graph 捕获与 peer-to-peer 探测不稳定 | `enforce_eager=True`、`disable_custom_all_reduce=True`、`NCCL_P2P_DISABLE=1`，并用 `gpu_memory_utilization=0.80` 给 KV cache 留边界 |
+| 首次前向传播时 `/usr/bin/ld: cannot find -lcuda` | FlashInfer 为 SM 7.5 现场 JIT 编译，nvcc 链接 `-lcuda`；`libcuda.so` 属于 NVIDIA **驱动**，Kaggle 容器没有 `libcuda.so` 也没有 stubs 目录 | 换 attention 后端为 **`TRITON_ATTN`**。纯 Triton 实现，不需要 nvcc/链接；同时把启动时间从 ~10 分钟降下来 |
+
+**注意区分** `libcudart.so.N`（CUDA **运行时**，pip 装得到）和 `libcuda.so.N`（CUDA **驱动**，只有宿主有）。两者的报错措辞很像，但修法完全不同：
+
+- `libcudart.so.*` 报错 → **import 阶段**失败，是依赖版本问题，改 vLLM 版本。
+- `libcuda.so` 报错 → **首次推理**失败（模型和 KV cache 都已就绪），是 attention 后端 JIT 编译问题，换后端。
 
 7B adapter 重载还遇到过 PEFT 将完整 target path 压缩成 `q_proj`/`v_proj` 后 provenance 校验失败。当前校验接受这种等价序列化，同时仍拒绝扩大的 target 范围。
 

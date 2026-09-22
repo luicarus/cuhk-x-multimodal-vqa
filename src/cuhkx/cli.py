@@ -52,6 +52,11 @@ def add_inference_backend(command):
                          help="vLLM tensor parallelism across visible GPUs (Kaggle 2x T4 default)")
     command.add_argument("--gpu-memory-utilization", type=float, default=0.80,
                          help="Fraction of each GPU vLLM may reserve")
+    command.add_argument("--attention-backend", default=None,
+                         choices=("TRITON_ATTN", "FLASHINFER", "FLEX_ATTENTION"),
+                         help="vLLM attention backend. Defaults to TRITON_ATTN because "
+                              "FlashInfer JIT-compiles SM 7.5 kernels and fails to link "
+                              "libcuda.so on Kaggle (no driver stubs).")
 
 
 def default_backend(profile):
@@ -70,12 +75,19 @@ def resolve_backend(args, profile):
     return chosen
 
 
+def default_attention_backend():
+    """FlashInfer cannot link on Kaggle; Triton needs no nvcc or driver stubs."""
+    return "TRITON_ATTN"
+
+
 def engine_options(args, profile):
     """Engine settings that must appear in the signed run contract."""
     if resolve_backend(args, profile) != "vllm":
         return {}
     return {"tensor_parallel_size": args.tensor_parallel_size,
-            "gpu_memory_utilization": args.gpu_memory_utilization}
+            "gpu_memory_utilization": args.gpu_memory_utilization,
+            "attention_backend": getattr(args, "attention_backend", None)
+            or default_attention_backend()}
 
 
 def build_backend(profile, config, args, run_output):
@@ -89,6 +101,8 @@ def build_backend(profile, config, args, run_output):
             config["baseline"], weights, adapter=adapter,
             tensor_parallel_size=args.tensor_parallel_size,
             gpu_memory_utilization=args.gpu_memory_utilization,
+            attention_backend=getattr(args, "attention_backend", None)
+            or default_attention_backend(),
         )
     if profile == "qwen35":
         from cuhkx.inference.qwen35 import Qwen35Backend
@@ -190,7 +204,9 @@ def main(argv: list[str] | None = None) -> int:
                                            adapter=args.adapter_dir,resume=args.resume,
                                            backend=resolve_backend(args, profile),
                                            tensor_parallel_size=args.tensor_parallel_size,
-                                           gpu_memory_utilization=args.gpu_memory_utilization)
+                                           gpu_memory_utilization=args.gpu_memory_utilization,
+                                           attention_backend=args.attention_backend
+                                           or default_attention_backend())
             print(json.dumps(result,ensure_ascii=False,indent=2))
             return 0 if result["status"] == "PASS" else 2
         if args.command == "verify-run":

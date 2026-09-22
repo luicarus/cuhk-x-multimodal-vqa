@@ -40,12 +40,12 @@ def test_qwen35_targets_cover_hybrid_text_decoder_without_vision_modules():
 def test_qwen35_train_lock_accepts_linux_markupsafe_wheel():
     lock = (PROJECT / "requirements/train_qwen35.lock.txt").read_text(encoding="utf-8")
     assert "--index-url https://pypi.org/simple" in lock
-    assert "--extra-index-url https://download.pytorch.org/whl/cu126" in lock
+    assert "--extra-index-url https://download.pytorch.org/whl/cu128" in lock
     assert "peft==0.18.0" in lock
-    # vLLM 0.21.0 pins the torch/torchvision pair.
-    assert "torchvision==0.26.0+cu126" in lock
-    assert "torch==2.11.0+cu126" in lock
-    assert "vllm==0.21.0" in lock
+    # vLLM 0.19.1 pins the torch/torchvision pair.
+    assert "torchvision==0.25.0+cu128" in lock
+    assert "torch==2.10.0+cu128" in lock
+    assert "vllm==0.19.1" in lock
     assert "-r qwen35.in" in (PROJECT / "requirements/train_qwen35.in").read_text(encoding="utf-8")
     start = lock.index("markupsafe==3.0.3")
     block = lock[start:lock.index("\nmdurl==", start)]
@@ -54,7 +54,7 @@ def test_qwen35_train_lock_accepts_linux_markupsafe_wheel():
 
 def test_qwen35_inference_lock_pairs_vllm_with_transformers_five():
     lock = (PROJECT / "requirements/qwen35.lock.txt").read_text(encoding="utf-8")
-    for pin in ("vllm==0.21.0", "torch==2.11.0+cu126", "torchvision==0.26.0+cu126",
+    for pin in ("vllm==0.19.1", "torch==2.10.0+cu128", "torchvision==0.25.0+cu128",
                 "transformers==5.17.0"):
         assert pin in lock, pin
     # The structured-output backends are what enforce the closed answer space.
@@ -62,7 +62,9 @@ def test_qwen35_inference_lock_pairs_vllm_with_transformers_five():
     # This lane must never drift into the 7B lane's Transformers 4.x toolchain.
     baseline = (PROJECT / "requirements/cloud.lock.txt").read_text(encoding="utf-8")
     assert "vllm==" not in baseline
+    # The 7B lane keeps its own cu126 toolchain and must never be swept along.
     assert "torch==2.7.1+cu126" in baseline
+    assert "transformers==4.57.6" in baseline
 
 
 def _pinned_packages(lock_text):
@@ -74,20 +76,38 @@ def _pinned_packages(lock_text):
 def test_qwen35_locks_keep_one_cuda_major_version(name):
     """A lock must not mix CUDA 12 and CUDA 13 packages.
 
-    vLLM declares `nvidia-cutlass-dsl[cu13]` from 0.22.1 onward. Combined with
-    a torch+cu126 build that yields a wheel set whose native extension links
-    libcudart.so.13 while only libcudart.so.12 is installed, so the lane fails
-    at `import vllm` on Kaggle's T4. Resolving successfully is not evidence that
-    the result is runnable; this guards the invariant directly.
+    The kernel extension shipped in the vLLM wheel hard-links one libcudart
+    major version: 0.19.1 links libcudart.so.12, while 0.20.2 and later link
+    libcudart.so.13. A CUDA 13 wheel on this CUDA 12.8 host fails at
+    `import vllm` with "libcudart.so.13: cannot open shared object file".
+    Resolving successfully is not evidence that the result is runnable, so the
+    invariant is guarded directly rather than inferred from metadata.
     """
     pinned = _pinned_packages((PROJECT / "requirements" / name).read_text(encoding="utf-8"))
     cuda13 = sorted(package for package in pinned if "cu13" in package)
     cuda12 = sorted(package for package in pinned if package.endswith("-cu12"))
-    assert not cuda13, f"{name} pulls CUDA 13 packages alongside a cu126 torch: {cuda13}"
+    assert not cuda13, f"{name} pulls CUDA 13 packages alongside a cu12 torch: {cuda13}"
     assert cuda12, f"{name} is missing the expected CUDA 12 runtime packages"
-    assert "torch==2.11.0+cu126" in (PROJECT / "requirements" / name).read_text(encoding="utf-8")
+    assert "torch==2.10.0+cu128" in (PROJECT / "requirements" / name).read_text(encoding="utf-8")
     # The CUDA 13 cutlass stack is exactly what breaks the import.
     assert "nvidia-cutlass-dsl-libs-cu13" not in pinned
+
+
+@pytest.mark.parametrize("name", ["qwen35.lock.txt", "train_qwen35.lock.txt"])
+def test_qwen35_locks_pin_vllm_from_the_cuda12_binary_line(name):
+    """Only vLLM releases whose wheel links libcudart.so.12 are usable here.
+
+    The cutover was established by extracting DT_NEEDED from the published
+    wheels: 0.19.1 links libcudart.so.12, 0.20.2 and 0.21.0 link
+    libcudart.so.13. This host is CUDA 12.8, so anything from 0.20.0 up fails
+    at import. Pinning the exact version keeps an innocuous-looking bump from
+    silently reintroducing the CUDA 13 link.
+    """
+    pinned = _pinned_packages((PROJECT / "requirements" / name).read_text(encoding="utf-8"))
+    assert pinned.get("vllm") == "0.19.1"
+    # 0.19.1 pins this torch/torchvision pair.
+    assert pinned.get("torch") == "2.10.0+cu128"
+    assert pinned.get("torchvision") == "0.25.0+cu128"
 
 
 def test_qwen35_training_notebook_keeps_cuda_package_index():
@@ -96,7 +116,7 @@ def test_qwen35_training_notebook_keeps_cuda_package_index():
     notebook = json.loads((PROJECT / "notebooks/qwen35-4b-qlora-vllm.ipynb").read_text(encoding="utf-8"))
     source = "\n".join(cell["source"] for cell in notebook["cells"] if cell["cell_type"] == "code")
     assert "--index-url" in source
-    assert "https://download.pytorch.org/whl/cu126" in source
+    assert "https://download.pytorch.org/whl/cu128" in source
     assert "import json, peft, transformers, vllm, torch" in source
     assert source.count('cloud("verify-run", "--profile", "qwen35", "--training-config", str(TRAINING_CONFIG)') == 3
 
@@ -129,6 +149,35 @@ def test_qwen35_vllm_backend_keeps_the_constrained_answer_space():
     assert "enforce_eager=True" in source
     assert "disable_custom_all_reduce=True" in source
     assert "NCCL_P2P_DISABLE" in source
+
+
+def test_qwen35_vllm_defaults_to_triton_attention():
+    """FlashInfer needs the driver's libcuda.so, which Kaggle does not ship.
+
+    FlashInfer JIT-compiles SM 7.5 kernels through nvcc and links `-lcuda`; the
+    container has no driver stubs, so the very first forward pass dies with
+    "cannot find -lcuda". TRITON_ATTN needs neither nvcc nor a link step.
+    """
+    source = (PROJECT / "src/cuhkx/inference/qwen35_vllm.py").read_text(encoding="utf-8")
+    assert 'attention_backend: str = "TRITON_ATTN"' in source
+    assert 'attention_config={"backend": attention_backend}' in source
+    # The alternative must stay reachable for hosts that do have driver stubs.
+    assert '"FLASHINFER"' in source
+    # The chosen backend is part of the run metadata, not just an internal default.
+    assert '"attention_backend": self.attention_backend' in source
+    assert "cannot find -lcuda" in source
+
+
+def test_qwen35_notebooks_pin_the_attention_backend():
+    import json
+
+    for name in ("qwen35-4b-vllm.ipynb", "qwen35-4b-qlora-vllm.ipynb"):
+        notebook = json.loads((PROJECT / "notebooks" / name).read_text(encoding="utf-8"))
+        source = "\n".join(cell["source"] for cell in notebook["cells"] if cell["cell_type"] == "code")
+        assert 'ATTENTION_BACKEND = "TRITON_ATTN"' in source, name
+        assert '"--attention-backend", ATTENTION_BACKEND' in source, name
+        # A silent fallback to FlashInfer would reintroduce the linker failure.
+        assert 'backend_metadata.get("attention_backend") != ATTENTION_BACKEND' in source, name
 
 
 def test_qwen35_vllm_is_not_shipped_to_the_baseline_lane():

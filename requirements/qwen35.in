@@ -3,19 +3,28 @@
 # vLLM is a runtime dependency of this lane only. The Qwen2.5-VL-7B lane keeps
 # torch 2.7.1 + Transformers 4.57.6 and must never receive this package.
 #
-# vLLM is pinned to 0.21.0 because it is the last release whose acceleration
-# stack targets CUDA 12: it declares a bare `nvidia-cutlass-dsl==4.4.2`.
-# From 0.22.1 onward vLLM declares `nvidia-cutlass-dsl[cu13]`, pulling a CUDA 13
-# runtime alongside torch's cu126 build. That combination fails at import with
-# "libcudart.so.13: cannot open shared object file", because torch==2.11.0+cu126
-# ships libcudart.so.12. Kaggle's T4 is SM 7.5 on a CUDA 12 driver, so the CUDA
-# 13 line is not usable there regardless of vLLM version.
-# vLLM also pins torch==2.11.0 and requires transformers>=4.56, both satisfied.
+# vLLM is pinned to 0.19.1 because it is the last release whose shipped binary
+# links libcudart.so.12. Reading the Python metadata is NOT sufficient to tell
+# a usable vLLM from a broken one; the CUDA major version lives in the compiled
+# extension. DT_NEEDED of vllm/_C.abi3.so, extracted from the published wheels:
+#
+#     vllm 0.19.1  ->  libcudart.so.12   (works on this CUDA 12.8 host)
+#     vllm 0.20.2  ->  libcudart.so.13
+#     vllm 0.21.0  ->  libcudart.so.13
+#
+# 0.20.0 is the real cutover, not 0.22.1. A wheel linking libcudart.so.13 fails
+# immediately on a CUDA 12 host with:
+#     ImportError: libcudart.so.13: cannot open shared object file
+# Kaggle's T4 is SM 7.5 on a CUDA 12.8 driver, so only the CUDA 12 line works.
+#
+# vLLM 0.19.1 pins torch==2.10.0 / torchvision==0.25.0 and requires
+# transformers>=4.56, satisfied by 5.17.0. The torch pin is built for cu128 to
+# match the host toolkit (torch.version.cuda == 12.8).
 Pillow==12.3.0
 PyYAML==6.0.3
 setuptools==78.1.0
-torch==2.11.0+cu126
-torchvision==0.26.0+cu126
+torch==2.10.0+cu128
+torchvision==0.25.0+cu128
 transformers==5.17.0
 accelerate==1.12.0
-vllm==0.21.0
+vllm==0.19.1

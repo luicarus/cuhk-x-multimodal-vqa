@@ -44,6 +44,6 @@ python scripts/package_cloud.py --output <new-package.zip>
 
 本地测试使用 `python scripts/test.py -q`，临时结果和 pytest 数据放在系统临时目录，完成后清除，不写入项目 reports/docs/outputs。只在终端汇报测试结果，不生成阶段验收文档。
 
-Qwen3.5-4B 对照使用独立的 `notebooks/qwen35-4b-vllm.ipynb` 和 `artifacts/cloud/qwen35_4b.zip`，test 推理走 vLLM 0.21.0 双卡张量并行；它不改变本 Notebook、7B 权重或 baseline 运行目录。Qwen3.5 需要单独的 `requirements/qwen35.lock.txt`，不能把 7B 的 4.57.6 环境直接换模型。
+Qwen3.5-4B 对照使用独立的 `notebooks/qwen35-4b-vllm.ipynb` 和 `artifacts/cloud/qwen35_4b.zip`，test 推理走 vLLM 0.19.1 双卡张量并行；它不改变本 Notebook、7B 权重或 baseline 运行目录。Qwen3.5 需要单独的 `requirements/qwen35.lock.txt`，不能把 7B 的 4.57.6 环境直接换模型。
 
 用户提供的 Notebook 已保存成功的 cloud smoke、pilot 评测和测试提交导出输出；本地没有对应完整权重或运行目录，不把这些输出替代为本机 GPU 验证。

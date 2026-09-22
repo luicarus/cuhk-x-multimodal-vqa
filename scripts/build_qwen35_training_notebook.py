@@ -29,7 +29,7 @@ CELLS = [
 | 阶段 | 引擎 | 原因 |
 |---|---|---|
 | 训练 / 训练中 dev 评估 | Transformers 5.17.0 | vLLM 只做推理，无法反传梯度 |
-| adapter 重载、dev/confirm 评估、test 推理 | **vLLM 0.21.0，TP=2** | 两卡张量并行加速 |
+| adapter 重载、dev/confirm 评估、test 推理 | **vLLM 0.19.1，TP=2** | 两卡张量并行加速 |
 
 两边共用同一份数据契约、prompt、答案空间和运行校验，因此 vLLM 的分数与 Transformers 可直接比较。运行合同记录 `engine` 字段，同一 run-id 不会混用两种引擎的结果。
 """),
@@ -46,6 +46,10 @@ EXPERIMENT = "qwen35_vllm_full_v1"
 TRAIN_GPU = 0          # 训练固定单卡，避免与 vLLM 的 TP 进程争抢显存
 TENSOR_PARALLEL = 2    # vLLM 张量并行度：2×T4
 GPU_MEMORY_UTILIZATION = 0.80
+# FlashInfer 会为 SM 7.5 现场 JIT 编译，最后一步需要链接 libcuda.so（属于 NVIDIA
+# 驱动，Kaggle 容器没有 stubs），报 "cannot find -lcuda"。TRITON_ATTN 是纯 Triton
+# 实现，不需要 nvcc/链接，因此作为默认值。
+ATTENTION_BACKEND = "TRITON_ATTN"
 RUN_CONFIRMATION = False
 RUN_TEST = False
 PACKAGE_ID = "cuhkx-qwen35-4b-qlora-vllm-v1"
@@ -159,11 +163,11 @@ if data_state["status"] != "PASS":
     raise RuntimeError("embedded five-fold caches are incomplete")
 print(json.dumps(data_state["coverage"], indent=2))
 '''),
-    cell("markdown", "## 3. 安装 Qwen3.5 后训练依赖（含 vLLM 0.21.0）并固定双卡环境"),
+    cell("markdown", "## 3. 安装 Qwen3.5 后训练依赖（含 vLLM 0.19.1）并固定双卡环境"),
     cell("code", r'''
 subprocess.run([str(PYTHON), "-m", "pip", "install", "--require-hashes",
                 "--only-binary=:all:", "--index-url", "https://pypi.org/simple",
-                "--extra-index-url", "https://download.pytorch.org/whl/cu126",
+                "--extra-index-url", "https://download.pytorch.org/whl/cu128",
                 "-r", str(REPO / "requirements/train_qwen35.lock.txt")], check=True)
 subprocess.run([str(PYTHON), "-m", "pip", "check"], check=True)
 compatibility_probe = (
@@ -232,9 +236,10 @@ ADAPTER = REPO / "artifacts/training/qwen35_pt_sft/adapter"
 '''),
     cell("markdown", "## 6. vLLM 双卡短跑：验证 TP=2 引擎、答案约束与 adapter 重载"),
     cell("code", r'''
-cloud("predict", "--profile", "qwen35", "--backend", "vllm",
-      "--tensor-parallel-size", str(TENSOR_PARALLEL),
-      "--gpu-memory-utilization", str(GPU_MEMORY_UTILIZATION),
+VLLM = ["--backend", "vllm", "--tensor-parallel-size", str(TENSOR_PARALLEL),
+        "--gpu-memory-utilization", str(GPU_MEMORY_UTILIZATION),
+        "--attention-backend", ATTENTION_BACKEND]
+cloud("predict", "--profile", "qwen35", *VLLM,
       "--dataset", "pilot", "--limit", "16",
       "--weights-dir", str(WEIGHTS), "--adapter-dir", str(SMOKE_ADAPTER),
       "--run-id", "qwen35_vllm_smoke_reload", "--resume")
@@ -244,12 +249,15 @@ if backend_metadata.get("backend") != "qwen35_4b_vllm":
     raise RuntimeError("smoke run did not use the vLLM engine")
 if backend_metadata.get("tensor_parallel_size") != TENSOR_PARALLEL:
     raise RuntimeError(f"vLLM ran with TP={backend_metadata.get('tensor_parallel_size')}, expected {TENSOR_PARALLEL}")
+if backend_metadata.get("attention_backend") != ATTENTION_BACKEND:
+    raise RuntimeError(f"vLLM ran with attention backend {backend_metadata.get('attention_backend')}, expected {ATTENTION_BACKEND}")
 print(json.dumps(backend_metadata, indent=2))
 '''),
     cell("markdown", "## 7. vLLM dev 基座/候选对照与 confirm 门禁"),
     cell("code", r'''
 VLLM = ["--backend", "vllm", "--tensor-parallel-size", str(TENSOR_PARALLEL),
-        "--gpu-memory-utilization", str(GPU_MEMORY_UTILIZATION)]
+        "--gpu-memory-utilization", str(GPU_MEMORY_UTILIZATION),
+        "--attention-backend", ATTENTION_BACKEND]
 cloud("evaluate-training", "--profile", "qwen35", "--training-config", str(TRAINING_CONFIG),
       *VLLM, "--split", "dev", "--weights-dir", str(WEIGHTS),
       "--run-id", "qwen35_pt_base_dev", "--resume")
@@ -310,7 +318,7 @@ CELLS[3]["source"] = secure_loader_source(
     extra_validation='''
 if manifest.get("training_cache_mode") != "embedded_complete":
     raise RuntimeError("training package does not contain the complete cache")
-if manifest.get("inference_engine") != "vllm_0.21.0_tensor_parallel":
+if manifest.get("inference_engine") != "vllm_0.19.1_tensor_parallel":
     raise RuntimeError("training package was not built for the vLLM dual-GPU lane")
 ''',
     extra_prints='print("Package:", PACKAGE_ID)',
@@ -321,7 +329,7 @@ CELLS[0]["source"] = """# Qwen3.5-4B QLoRA: vLLM Dual-GPU
 
 This independent training notebook reuses the existing IR4 input protocol and embeds the complete five-fold cache. Create the package locally, copy its printed `manifest_sha256` into `EXPECTED_MANIFEST_SHA256` in the first code cell, and attach that exact `qwen35_4b_qlora.zip` as a private Kaggle input. This authenticates the manifest before any project code is copied or installed.
 
-Training and evaluation-under-training stay on Transformers, because vLLM is inference-only. Adapter reload checks, dev/confirm evaluation, and test inference run on **vLLM 0.21.0 with tensor parallelism across both T4 GPUs**. Both engines share the same data contract and constrained answer space, and the run contract records which engine produced each result.
+Training and evaluation-under-training stay on Transformers, because vLLM is inference-only. Adapter reload checks, dev/confirm evaluation, and test inference run on **vLLM 0.19.1 with tensor parallelism across both T4 GPUs**. Both engines share the same data contract and constrained answer space, and the run contract records which engine produced each result.
 
 The package contains no model weights. Use a Kaggle 2x T4 session; the notebook verifies that both GPUs are visible before vLLM starts.
 """

@@ -56,7 +56,7 @@ flowchart LR
 
 - **确定性输入协议**：固定选帧、图像尺寸、prompt 版本和答案解析规则，保证模型对比只改变目标变量。
 - **多模型隔离**：Qwen2.5-VL-7B 与 Qwen3.5-4B 使用独立配置、依赖锁、Notebook、权重校验和运行目录。
-- **vLLM 双卡加速**：Qwen3.5-4B 的 adapter 重载、dev/confirm 评估与 test 推理在 2×T4 上以 vLLM 0.21.0 张量并行运行；训练仍走 Transformers，因为 vLLM 不支持训练。运行合同记录 `engine`，两种引擎的结果不会混用同一 run-id。
+- **vLLM 双卡加速**：Qwen3.5-4B 的 adapter 重载、dev/confirm 评估与 test 推理在 2×T4 上以 vLLM 0.19.1 张量并行运行；训练仍走 Transformers，因为 vLLM 不支持训练。运行合同记录 `engine`，两种引擎的结果不会混用同一 run-id。
 - **可恢复执行**：推理和训练保存 contract、checkpoint、数据签名与环境信息，支持安全 `--resume`。
 - **严格 adapter 验证**：检查 LoRA target、基础模型 revision、权重有限性、非零更新和来源收据。
 - **防数据泄漏门禁**：先在 dev 选择候选，再运行 confirm；只有 confirm 提升后才生成 test submission。

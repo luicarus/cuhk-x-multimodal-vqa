@@ -49,6 +49,28 @@ VLLM_ENGINE_ENV = {
 }
 
 
+# vLLM's attention backends differ in what they need at *run* time, not just at
+# import time, so the choice is part of the lane's runtime contract.
+#
+# FLASHINFER is vLLM's automatic first choice, but on a Kaggle T4 it JIT-compiles
+# SM 7.5 kernels through the host CUDA toolkit, and the final link step asks for
+# the driver library:
+#
+#     nvcc ... -gencode=arch=compute_75,code=sm_75 ... -lcudart -lcuda
+#     /usr/bin/ld: cannot find -lcuda: No such file or directory
+#
+# libcuda.so belongs to the NVIDIA *driver*, not to the CUDA runtime that pip
+# installs, and Kaggle's container has no driver stubs directory. The failure
+# only appears on the first real forward pass, after the model and KV cache are
+# already up, which makes it look like a later bug than it is. That same JIT
+# also dominated startup (~9 minutes) before it failed.
+#
+# TRITON_ATTN ships as pure Triton, needs no nvcc/link step, and reports
+# supports_compute_capability() == True for every device. It supports float16,
+# which is this lane's dtype, so it is the default here.
+ATTENTION_BACKENDS = ("TRITON_ATTN", "FLASHINFER", "FLEX_ATTENTION")
+
+
 def apply_engine_environment(environment=None) -> dict:
     """Populate vLLM/NCCL defaults without overwriting explicit overrides."""
     import os
@@ -131,10 +153,13 @@ class Qwen35VLLMBackend:
 
     def __init__(self, baseline: dict, weights: Path, adapter: Path | None = None,
                  *, tensor_parallel_size: int = 2, gpu_memory_utilization: float = 0.80,
-                 enable_prefix_caching: bool = True, max_model_len: int = 4096):
+                 enable_prefix_caching: bool = True, max_model_len: int = 4096,
+                 attention_backend: str = "TRITON_ATTN"):
         require(tensor_parallel_size >= 1, "tensor parallel size must be positive")
         require(0.0 < gpu_memory_utilization < 1.0, "gpu memory utilization must be a fraction")
         require(max_model_len >= 1024, "max_model_len is implausibly small")
+        require(attention_backend in ATTENTION_BACKENDS,
+                f"unsupported attention backend: {attention_backend}")
         apply_engine_environment()
 
         import torch
@@ -152,6 +177,7 @@ class Qwen35VLLMBackend:
         self.StructuredOutputsParams = StructuredOutputsParams
         self.image_size = baseline["frames"]["input_image_size"]
         self.tensor_parallel_size = tensor_parallel_size
+        self.attention_backend = attention_backend
 
         started = time.perf_counter()
         # use_fast=False mirrors the reference backend: the slow image processor
@@ -173,6 +199,7 @@ class Qwen35VLLMBackend:
             enable_prefix_caching=enable_prefix_caching,
             disable_custom_all_reduce=True,
             max_num_seqs=1,
+            attention_config={"backend": attention_backend},
             # A LoRA adapter needs the LoRA path compiled into the engine.
             enable_lora=adapter is not None,
             max_loras=1,
@@ -247,6 +274,7 @@ class Qwen35VLLMBackend:
             "model_class": type(self.engine).__name__,
             "image_size": self.image_size,
             "tensor_parallel_size": self.tensor_parallel_size,
+            "attention_backend": self.attention_backend,
             "enforce_eager": True,
             "disable_custom_all_reduce": True,
             "answer_constraint": "structured_outputs_choice",
