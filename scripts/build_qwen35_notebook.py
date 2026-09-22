@@ -44,6 +44,10 @@ GPU_MEMORY_UTILIZATION = 0.80
 # 驱动，Kaggle 容器没有 stubs），报 "cannot find -lcuda"。TRITON_ATTN 是纯 Triton
 # 实现，不需要 nvcc/链接，因此作为默认值。
 ATTENTION_BACKEND = "TRITON_ATTN"
+# B 轮：调度并发 32。KV cache（89,232 tokens，block=528）按 909 token/请求可容纳
+# 84 条；视觉 encoder cache（16,384 tokens，单请求 784）限制同时 prefill 约 20 条，
+# 超出部分由引擎排队。runner 会按这个值分批提交。
+MAX_NUM_SEQS = 32
 '''),
     cell("markdown", "## 1. 验证 Qwen3.5 vLLM 包并准备独立工作目录"),
     cell("code", '''
@@ -193,7 +197,8 @@ print("Qwen3.5 revision:", PINNED_REVISION)
     cell("code", '''
 VLLM = ["--backend", "vllm", "--tensor-parallel-size", str(TENSOR_PARALLEL),
         "--gpu-memory-utilization", str(GPU_MEMORY_UTILIZATION),
-        "--attention-backend", ATTENTION_BACKEND]
+        "--attention-backend", ATTENTION_BACKEND,
+        "--max-num-seqs", str(MAX_NUM_SEQS)]
 cloud("predict", "--profile", "qwen35", *VLLM, "--dataset", "test", "--limit", "16",
       "--run-id", "qwen35_4b_smoke", "--weights-dir", str(WEIGHTS), "--resume")
 cloud("verify-run", "--profile", "qwen35", "--run-id", "qwen35_4b_smoke")

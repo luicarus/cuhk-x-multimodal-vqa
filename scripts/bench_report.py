@@ -212,6 +212,22 @@ def main() -> int:
               f"{_fmt(run['seconds_per_request'], 8)} {_fmt(run['requests_per_second'], 8)}")
 
     with_latency = [run for run in runs if run["latency"].get("requests")]
+    with_batches = [run for run in runs if run["latency"].get("batched")]
+    if with_batches:
+        # The batched view is the honest throughput mechanism: requests are
+        # interleaved by the scheduler, so per-request latency does not exist.
+        print("\nbatched execution (per-request latency not observable)")
+        print(f"{'run':<34} {'batches':>8} {'N':>5} {'mean sz':>8} {'mean batch ms':>14} "
+              f"{'amort ms/req':>13} {'req/s':>8} {'token/s':>9}")
+        print("-" * 120)
+        for run in with_batches:
+            batch = run["latency"]["batch"]
+            print(f"{run['run_id']:<34} {batch['batches']:>8} {batch['requests']:>5} "
+                  f"{_fmt(batch.get('mean_batch_size'), 8, 1)} "
+                  f"{_fmt(batch.get('mean_batch_ms'), 14, 1)} "
+                  f"{_fmt(batch.get('amortized_ms_per_request'), 13)} "
+                  f"{_fmt(batch.get('throughput_rps'), 8)} "
+                  f"{_fmt(batch.get('token_rate'), 9)}")
     if with_latency:
         print("\nlatency per request (ms)")
         print(f"{'run':<34} {'warmup':>7} {'p50':>9} {'p90':>9} {'p95':>9} {'p99':>9} "

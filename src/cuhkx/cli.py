@@ -57,6 +57,9 @@ def add_inference_backend(command):
                          help="vLLM attention backend. Defaults to TRITON_ATTN because "
                               "FlashInfer JIT-compiles SM 7.5 kernels and fails to link "
                               "libcuda.so on Kaggle (no driver stubs).")
+    command.add_argument("--max-num-seqs", type=int, default=1,
+                         help="vLLM scheduler concurrency. Above 1 the runner submits "
+                              "requests in batches so the engine can interleave them.")
 
 
 def default_backend(profile):
@@ -87,7 +90,8 @@ def engine_options(args, profile):
     return {"tensor_parallel_size": args.tensor_parallel_size,
             "gpu_memory_utilization": args.gpu_memory_utilization,
             "attention_backend": getattr(args, "attention_backend", None)
-            or default_attention_backend()}
+            or default_attention_backend(),
+            "max_num_seqs": args.max_num_seqs}
 
 
 def build_backend(profile, config, args, run_output):
@@ -103,6 +107,7 @@ def build_backend(profile, config, args, run_output):
             gpu_memory_utilization=args.gpu_memory_utilization,
             attention_backend=getattr(args, "attention_backend", None)
             or default_attention_backend(),
+            max_num_seqs=args.max_num_seqs,
         )
     if profile == "qwen35":
         from cuhkx.inference.qwen35 import Qwen35Backend
@@ -206,7 +211,8 @@ def main(argv: list[str] | None = None) -> int:
                                            tensor_parallel_size=args.tensor_parallel_size,
                                            gpu_memory_utilization=args.gpu_memory_utilization,
                                            attention_backend=args.attention_backend
-                                           or default_attention_backend())
+                                           or default_attention_backend(),
+                                           max_num_seqs=args.max_num_seqs)
             print(json.dumps(result,ensure_ascii=False,indent=2))
             return 0 if result["status"] == "PASS" else 2
         if args.command == "verify-run":

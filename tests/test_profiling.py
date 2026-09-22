@@ -351,3 +351,42 @@ def test_report_prints_latency_table_when_timing_is_present(tmp_path):
     assert "latency per request" in result.stdout
     assert "phase breakdown" in result.stdout
     assert "40.000" in result.stdout
+
+
+def test_report_shows_the_batched_view(tmp_path):
+    """A batched run must be readable without fabricated per-request numbers."""
+    rows = [("p1", "A"), ("p2", "B"), ("p3", "C")]
+    latency = {
+        "requests": 0, "warmup_skipped": 0, "batched": True,
+        "batch": {"batches": 1, "requests": 3, "batch_sizes": [3],
+                  "total_ms": 900.0, "mean_batch_ms": 900.0, "mean_batch_size": 3.0,
+                  "throughput_rps": 3.3333, "token_rate": 3.3333,
+                  "amortized_ms_per_request": 300.0},
+    }
+    _write_run(tmp_path, "batched", elapsed=1.0, load=0.0, resumed=0, rows=rows,
+               latency=latency)
+
+    result = _report(tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert "batched execution" in result.stdout
+    assert "300.000" in result.stdout
+
+
+def test_timer_batch_view_amortizes_over_the_whole_run():
+    from cuhkx.inference.profiling import RequestTimer
+
+    timer = RequestTimer()
+    timer.record_batch(batch_ms=1000.0, image_ms=50.0, generate_ms=900.0,
+                       size=8, ttft_ms=120.0, generation_tokens=8)
+    timer.record_batch(batch_ms=500.0, image_ms=25.0, generate_ms=450.0,
+                       size=4, ttft_ms=130.0, generation_tokens=4)
+    view = timer.summary()["batch"]
+    assert view["batches"] == 2
+    assert view["requests"] == 12
+    assert view["batch_sizes"] == [8, 4]
+    # 12 requests over 1.5 s.
+    assert view["throughput_rps"] == 8.0
+    assert view["amortized_ms_per_request"] == 125.0
+    assert view["mean_batch_size"] == 6.0
+    with pytest.raises(ValueError):
+        timer.record_batch(batch_ms=1.0, image_ms=0.0, generate_ms=0.0, size=0)

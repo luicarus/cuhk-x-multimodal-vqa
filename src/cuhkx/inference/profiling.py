@@ -159,6 +159,10 @@ class RequestTimer:
     def __init__(self, warmup=WARMUP_REQUESTS):
         self.warmup = warmup
         self.samples = []
+        # Batches are the unit of scheduling in the batched runner. Per-request
+        # latencies lose their meaning when N requests finish together, so the
+        # batch view is what actually shows the throughput mechanism.
+        self.batches = []
 
     def record(self, qa_id, *, total_ms, image_ms, generate_ms, status,
                ttft_ms=None, generation_tokens=None):
@@ -174,6 +178,48 @@ class RequestTimer:
             "ttft_ms": None if ttft_ms is None else round(ttft_ms, 3),
             "generation_tokens": generation_tokens,
         })
+
+    def record_batch(self, *, batch_ms, image_ms, generate_ms, size,
+                     ttft_ms=None, generation_tokens=0):
+        """One timing sample for a whole submitted batch.
+
+        Per-request latency is not derivable from a batched call: the engine
+        interleaves the requests, so each finished answer does not own a
+        measurable slice of the wall clock. Reporting fabricated per-request
+        numbers would be worse than reporting the batch, so the batch is the
+        sample and throughput comes from size over batch time.
+        """
+        require(batch_ms >= 0 and image_ms >= 0 and generate_ms >= 0, "negative duration")
+        require(size >= 1, "an empty batch has no timing")
+        self.batches.append({
+            "size": size,
+            "batch_ms": round(batch_ms, 3),
+            "image_ms": round(image_ms, 3),
+            "generate_ms": round(generate_ms, 3),
+            "overhead_ms": round(max(0.0, batch_ms - image_ms - generate_ms), 3),
+            "ttft_ms": None if ttft_ms is None else round(ttft_ms, 3),
+            "generation_tokens": generation_tokens,
+        })
+
+    def _batch_view(self):
+        if not self.batches:
+            return None
+        total_ms = sum(batch["batch_ms"] for batch in self.batches)
+        requests = sum(batch["size"] for batch in self.batches)
+        tokens = sum(batch["generation_tokens"] for batch in self.batches)
+        return {
+            "batches": len(self.batches),
+            "requests": requests,
+            "batch_sizes": [batch["size"] for batch in self.batches],
+            "total_ms": round(total_ms, 3),
+            "mean_batch_ms": round(total_ms / len(self.batches), 3),
+            "mean_batch_size": round(requests / len(self.batches), 3),
+            "throughput_rps": round(requests / (total_ms / 1000.0), 4) if total_ms else 0.0,
+            "token_rate": round(tokens / (total_ms / 1000.0), 4) if total_ms and tokens else None,
+            # Amortized per-request cost is the number to compare against the
+            # sequential runner's s/req; it is not a latency measurement.
+            "amortized_ms_per_request": round(total_ms / requests, 3) if requests else None,
+        }
 
     def _phase(self, name, samples):
         if not samples:
@@ -210,8 +256,14 @@ class RequestTimer:
         return round(tokens / (steady_ms / 1000.0), 4) if steady_ms else None
 
     def summary(self):
-        if not self.samples:
+        batch_view = self._batch_view()
+        if not self.samples and not self.batches:
             return {"requests": 0, "warmup_skipped": 0}
+        if not self.samples:
+            # Batched run: per-request timing is not observable, so the summary
+            # is the batch view plus the memory/consistency evidence.
+            return {"requests": 0, "warmup_skipped": 0, "batched": True,
+                    "batch": batch_view}
         warm = self.samples[self.warmup:]
         # A resumed run may legitimately finish in fewer requests than the warmup
         # window; fall back to the full set rather than reporting nothing.
@@ -237,6 +289,8 @@ class RequestTimer:
             "steady_state_ttft_ms": self._ttft(steady),
             "steady_state_token_rate": self._token_rate(steady),
             "generation_tokens": sum(sample["generation_tokens"] or 0 for sample in self.samples),
+            "batched": bool(self.batches),
+            "batch": batch_view,
             "slowest_requests": sorted(
                 ({"qa_id": s["qa_id"], "total_ms": s["total_ms"], "status": s["status"]}
                  for s in self.samples), key=lambda item: item["total_ms"], reverse=True)[:5],

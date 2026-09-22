@@ -141,12 +141,13 @@ class Qwen35VLLMBackend:
     def __init__(self, baseline: dict, weights: Path, adapter: Path | None = None,
                  *, tensor_parallel_size: int = 2, gpu_memory_utilization: float = 0.80,
                  enable_prefix_caching: bool = True, max_model_len: int = 4096,
-                 attention_backend: str = "TRITON_ATTN"):
+                 attention_backend: str = "TRITON_ATTN", max_num_seqs: int = 1):
         require(tensor_parallel_size >= 1, "tensor parallel size must be positive")
         require(0.0 < gpu_memory_utilization < 1.0, "gpu memory utilization must be a fraction")
         require(max_model_len >= 1024, "max_model_len is implausibly small")
         require(attention_backend in ATTENTION_BACKENDS,
                 f"unsupported attention backend: {attention_backend}")
+        require(max_num_seqs >= 1, "max_num_seqs must allow at least one sequence")
         apply_engine_environment()
 
         import torch
@@ -165,6 +166,7 @@ class Qwen35VLLMBackend:
         self.image_size = baseline["frames"]["input_image_size"]
         self.tensor_parallel_size = tensor_parallel_size
         self.attention_backend = attention_backend
+        self.max_num_seqs = max_num_seqs
 
         started = time.perf_counter()
         # use_fast=False mirrors the reference backend: the slow image processor
@@ -185,7 +187,7 @@ class Qwen35VLLMBackend:
             enforce_eager=True,
             enable_prefix_caching=enable_prefix_caching,
             disable_custom_all_reduce=True,
-            max_num_seqs=1,
+            max_num_seqs=max_num_seqs,
             attention_config={"backend": attention_backend},
             # LLM.__init__ forces disable_log_stats=True when the caller does not
             # pass it, and the output processor then attaches RequestStateStats
@@ -273,6 +275,74 @@ class Qwen35VLLMBackend:
         self.last_metrics = _engine_metrics(output)
         return output.outputs[0].text.strip()
 
+    def generate_batch(self, batch, *, max_new_tokens):
+        """Run many requests through the engine in one scheduler pass.
+
+        ``batch`` is a list of ``(images, prompt, allowed_outputs)`` triples. The
+        engine interleaves them, so this returns answers in input order without
+        any per-request timing: the batch is the smallest honest unit here, which
+        is why the runner records a batch sample rather than fabricating one per
+        request.
+
+        ``max_num_seqs`` bounds how many the scheduler actually runs at once; the
+        engine handles the excess by queuing, so an oversized batch degrades to
+        multiple passes rather than failing.
+        """
+        require(bool(batch), "an empty batch has nothing to generate")
+        encode_started = time.perf_counter()
+        conversations = []
+        for images, prompt, allowed_outputs in batch:
+            require(len(images) == 4, "Qwen3.5 IR4 requires exactly four images")
+            outputs = tuple(allowed_outputs)
+            require(outputs and all(isinstance(value, str) and value for value in outputs),
+                    "the constrained answer space must be non-empty text")
+            require(max_new_tokens >= max(len(value) for value in outputs),
+                    "max_new_tokens cannot cover the answer space")
+            content = [{"type": "image_url",
+                        "image_url": {"url": _data_uri(image), "detail": "high"}}
+                       for image in images]
+            content.append({"type": "text", "text": prompt})
+            conversations.append([{"role": "user", "content": content}])
+        self.last_encode_seconds = time.perf_counter() - encode_started
+
+        parameters = self.SamplingParams(
+            temperature=0.0,
+            top_p=1.0,
+            max_tokens=max_new_tokens,
+            skip_special_tokens=True,
+            structured_outputs=self.StructuredOutputsParams(
+                choice=[list(outputs) for _, _, outputs in batch]),
+        )
+        started = time.perf_counter()
+        results = self.engine.chat(
+            conversations,
+            sampling_params=parameters,
+            use_tqdm=False,
+            add_generation_prompt=True,
+            chat_template_kwargs={"enable_thinking": False},
+            lora_request=self.adapter_request,
+        )
+        generate_seconds = time.perf_counter() - started
+        require(len(results) == len(batch), "vLLM returned the wrong number of results")
+        answers = [result.outputs[0].text.strip() for result in results]
+        # Engine-side aggregates over the batch, for the runner to record.
+        metrics = [_engine_metrics(result) for result in results]
+        reported = [value for value in metrics if value.get("reported")]
+        self.last_metrics = {
+            "reported": bool(reported),
+            "first_token_latency_max": max((float(v.get("first_token_latency", 0.0))
+                                            for v in reported), default=None),
+            "first_token_latency_mean": (sum(float(v.get("first_token_latency", 0.0))
+                                             for v in reported) / len(reported)) if reported else None,
+            "num_generation_tokens": sum(int(v.get("num_generation_tokens", 0))
+                                         for v in reported) or None,
+            "num_prompt_tokens": sum(int(v.get("num_prompt_tokens", 0))
+                                     for v in reported) or None,
+            "batch_generate_seconds": generate_seconds,
+            "batch_size": len(batch),
+        }
+        return answers
+
     def worker_memory(self):
         """Per-worker GPU memory, sampled inside each vLLM worker process.
 
@@ -300,6 +370,7 @@ class Qwen35VLLMBackend:
             "image_size": self.image_size,
             "tensor_parallel_size": self.tensor_parallel_size,
             "attention_backend": self.attention_backend,
+            "max_num_seqs": self.max_num_seqs,
             "enforce_eager": True,
             "disable_custom_all_reduce": True,
             "answer_constraint": "structured_outputs_choice",

@@ -50,6 +50,10 @@ GPU_MEMORY_UTILIZATION = 0.80
 # 驱动，Kaggle 容器没有 stubs），报 "cannot find -lcuda"。TRITON_ATTN 是纯 Triton
 # 实现，不需要 nvcc/链接，因此作为默认值。
 ATTENTION_BACKEND = "TRITON_ATTN"
+# B 轮：调度并发 32。KV cache（89,232 tokens，block=528）按 909 token/请求可容纳
+# 84 条；视觉 encoder cache（16,384 tokens，单请求 784）限制同时 prefill 约 20 条，
+# 超出部分由引擎排队。runner 会按这个值分批提交。
+MAX_NUM_SEQS = 32
 RUN_CONFIRMATION = False
 RUN_TEST = False
 PACKAGE_ID = "cuhkx-qwen35-4b-qlora-vllm-v1"
@@ -238,7 +242,8 @@ ADAPTER = REPO / "artifacts/training/qwen35_pt_sft/adapter"
     cell("code", r'''
 VLLM = ["--backend", "vllm", "--tensor-parallel-size", str(TENSOR_PARALLEL),
         "--gpu-memory-utilization", str(GPU_MEMORY_UTILIZATION),
-        "--attention-backend", ATTENTION_BACKEND]
+        "--attention-backend", ATTENTION_BACKEND,
+        "--max-num-seqs", str(MAX_NUM_SEQS)]
 cloud("predict", "--profile", "qwen35", *VLLM,
       "--dataset", "pilot", "--limit", "16",
       "--weights-dir", str(WEIGHTS), "--adapter-dir", str(SMOKE_ADAPTER),
@@ -257,7 +262,8 @@ print(json.dumps(backend_metadata, indent=2))
     cell("code", r'''
 VLLM = ["--backend", "vllm", "--tensor-parallel-size", str(TENSOR_PARALLEL),
         "--gpu-memory-utilization", str(GPU_MEMORY_UTILIZATION),
-        "--attention-backend", ATTENTION_BACKEND]
+        "--attention-backend", ATTENTION_BACKEND,
+        "--max-num-seqs", str(MAX_NUM_SEQS)]
 cloud("evaluate-training", "--profile", "qwen35", "--training-config", str(TRAINING_CONFIG),
       *VLLM, "--split", "dev", "--weights-dir", str(WEIGHTS),
       "--run-id", "qwen35_pt_base_dev", "--resume")

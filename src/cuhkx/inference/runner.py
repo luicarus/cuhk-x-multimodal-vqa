@@ -37,6 +37,57 @@ def profiling_torch():
     return torch if torch.cuda.is_available() else None
 
 
+def _run_one(backend, qa, prompts, config, checked, data, records, target_ids,
+             signature, timer, output, targets_len):
+    """Sequential path: one request at a time. Returns the request status."""
+    qa_id = qa["qa_id"]
+    images = []
+    raw, prediction, error, status = "", None, None, "failed"
+    request_started = time.perf_counter()
+    image_ms = generate_ms = 0.0
+    metrics = {}
+    try:
+        phase_started = time.perf_counter()
+        for relative in checked["selected_frames"][qa_id]:
+            with Image.open(inside(data, relative)) as image:
+                image.load()
+                images.append(image.copy())
+        image_ms = (time.perf_counter() - phase_started) * 1000.0
+        phase_started = time.perf_counter()
+        raw = backend.generate(images, prompts[qa_id],
+            allowed_outputs=allowed_answer_outputs(qa["category"], available_option_letters(qa)),
+            max_new_tokens=config["baseline"]["generation"]["max_new_tokens"])
+        generate_ms = (time.perf_counter() - phase_started) * 1000.0
+        metrics = request_metrics(backend)
+        require(isinstance(raw, str), "backend output must be text")
+        parsed = parse_model_answer(raw, category=qa["category"], valid_options=available_option_letters(qa))
+        if parsed.is_valid and raw in allowed_answer_outputs(qa["category"], available_option_letters(qa)):
+            status, prediction = "valid", parsed.prediction
+        else:
+            status, error = "invalid", parsed.error or "output violates constrained answer space"
+    except Exception as exc:
+        raw, prediction, error = "", None, f"{type(exc).__name__}: {exc}"
+    finally:
+        for image in images:
+            image.close()
+    record = {"qa_id": qa_id, "status": status, "raw_output": raw, "prediction": prediction,
+              "error": error, "attempts": records.get(qa_id, {}).get("attempts", 0) + 1,
+              "signature": signature, "prompt_sha256": fingerprint(prompts[qa_id]),
+              "selected_frames": checked["selected_frames"][qa_id]}
+    record["record_sha256"] = fingerprint(record)
+    records[qa_id] = record
+    ordered = [records[q] for q in target_ids if q in records]
+    atomic_write(output / "checkpoint.jsonl", _jsonl(ordered))
+    # Recorded after the checkpoint write so total_ms covers the full
+    # per-request cost, including the O(n) rewrite of checkpoint.jsonl.
+    timer.record(qa_id, total_ms=(time.perf_counter() - request_started) * 1000.0,
+                 image_ms=image_ms, generate_ms=generate_ms, status=status,
+                 ttft_ms=metrics.get("ttft_ms"),
+                 generation_tokens=metrics.get("generation_tokens"))
+    print(f"{qa_id}: {status} ({sum(r['status'] == 'valid' for r in records.values())}/{targets_len} valid)", flush=True)
+    return status
+
+
 def verify_completed_run(config, run_id, prepared_input=None):
     """Read-only validation for evaluation/export. Caller holds the run lock."""
     output = output_directory(config, run_id)
@@ -223,54 +274,91 @@ def run_predictions(config, dataset, limit, run_id, model_source, backend_factor
         memory_peaks = {}
         if pending:
             memory_before = sample_gpu_memory(profiling_torch())
-        for qa in pending:
-            qa_id = qa["qa_id"]
-            images = []
-            raw, prediction, error, status = "", None, None, "failed"
-            request_started = time.perf_counter()
-            image_ms = generate_ms = 0.0
-            metrics = {}
+        batch_size = int((engine_options or {}).get("max_num_seqs") or 1)
+        require(batch_size >= 1, "max_num_seqs must allow at least one sequence")
+        if batch_size > 1:
+            # A concurrent scheduler is pointless unless the runner submits more
+            # than one request at a time; the engine setting selects the path.
+            require(hasattr(backend, "generate_batch"),
+                    f"engine {engine} does not support batched submission")
+        for start in range(0, len(pending), batch_size):
+            batch = pending[start:start + batch_size]
+            if batch_size == 1:
+                status = _run_one(backend, batch[0], prompts, config, checked, data,
+                                  records, target_ids, signature, timer, output,
+                                  len(targets))
+                if status != "valid" and fail_fast:
+                    break
+                continue
+
+            # Load every frame set first: the decode is cheap (~8 ms per request)
+            # and keeping it outside the timed region shows the batched call as
+            # one engine operation, which is what the batch view wants to measure.
+            batch_images = []
+            image_started = time.perf_counter()
             try:
-                phase_started = time.perf_counter()
-                for relative in checked["selected_frames"][qa_id]:
-                    with Image.open(inside(data, relative)) as image:
-                        image.load()
-                        images.append(image.copy())
-                image_ms = (time.perf_counter() - phase_started) * 1000.0
-                phase_started = time.perf_counter()
-                raw = backend.generate(images, prompts[qa_id],
-                    allowed_outputs=allowed_answer_outputs(qa["category"], available_option_letters(qa)),
-                    max_new_tokens=config["baseline"]["generation"]["max_new_tokens"])
-                generate_ms = (time.perf_counter() - phase_started) * 1000.0
+                for qa in batch:
+                    images = []
+                    for relative in checked["selected_frames"][qa["qa_id"]]:
+                        with Image.open(inside(data, relative)) as image:
+                            image.load()
+                            images.append(image.copy())
+                    batch_images.append(images)
+                triples = [(batch_images[index], prompts[qa["qa_id"]],
+                            allowed_answer_outputs(qa["category"], available_option_letters(qa)))
+                           for index, qa in enumerate(batch)]
+                raws = backend.generate_batch(
+                    triples, max_new_tokens=config["baseline"]["generation"]["max_new_tokens"])
+                batch_ms = (time.perf_counter() - image_started) * 1000.0
                 metrics = request_metrics(backend)
-                require(isinstance(raw, str), "backend output must be text")
-                parsed = parse_model_answer(raw, category=qa["category"], valid_options=available_option_letters(qa))
-                if parsed.is_valid and raw in allowed_answer_outputs(qa["category"], available_option_letters(qa)):
-                    status, prediction = "valid", parsed.prediction
-                else:
-                    status, error = "invalid", parsed.error or "output violates constrained answer space"
-            except Exception as exc:
-                raw, prediction, error = "", None, f"{type(exc).__name__}: {exc}"
-                run_error = error
+                for qa, images, raw in zip(batch, batch_images, raws, strict=True):
+                    qa_id = qa["qa_id"]
+                    # Per-request state must reset inside the loop: a variable set
+                    # on a failed request would otherwise leak into the next one.
+                    status, prediction, error, raw_output = "failed", None, None, ""
+                    try:
+                        require(isinstance(raw, str), "backend output must be text")
+                        parsed = parse_model_answer(raw, category=qa["category"],
+                                                    valid_options=available_option_letters(qa))
+                        if parsed.is_valid and raw in allowed_answer_outputs(
+                                qa["category"], available_option_letters(qa)):
+                            status, prediction = "valid", parsed.prediction
+                        else:
+                            status = "invalid"
+                            prediction = None
+                            error = parsed.error or "output violates constrained answer space"
+                        raw_output = raw
+                    except Exception as exc:            # noqa: BLE001 - per-request guard
+                        status, prediction, error, raw_output = "failed", None, f"{type(exc).__name__}: {exc}", ""
+                        run_error = error
+                    record = {"qa_id": qa_id, "status": status, "raw_output": raw_output,
+                              "prediction": prediction, "error": error,
+                              "attempts": records.get(qa_id, {}).get("attempts", 0) + 1,
+                              "signature": signature,
+                              "prompt_sha256": fingerprint(prompts[qa_id]),
+                              "selected_frames": checked["selected_frames"][qa_id]}
+                    record["record_sha256"] = fingerprint(record)
+                    records[qa_id] = record
+                    print(f"{qa_id}: {status} "
+                          f"({sum(r['status'] == 'valid' for r in records.values())}/{len(targets)} valid)",
+                          flush=True)
             finally:
-                for image in images:
-                    image.close()
-            record = {"qa_id": qa_id, "status": status, "raw_output": raw, "prediction": prediction,
-                      "error": error, "attempts": records.get(qa_id, {}).get("attempts", 0) + 1,
-                      "signature": signature, "prompt_sha256": fingerprint(prompts[qa_id]),
-                      "selected_frames": checked["selected_frames"][qa_id]}
-            record["record_sha256"] = fingerprint(record)
-            records[qa_id] = record
+                for images in batch_images:
+                    for image in images:
+                        image.close()
+            # The batch record lands after its checkpoint write, matching the
+            # sequential path's convention that timing includes bookkeeping.
             ordered = [records[q] for q in target_ids if q in records]
             atomic_write(output / "checkpoint.jsonl", _jsonl(ordered))
-            # Recorded after the checkpoint write so total_ms covers the full
-            # per-request cost, including the O(n) rewrite of checkpoint.jsonl.
-            timer.record(qa_id, total_ms=(time.perf_counter() - request_started) * 1000.0,
-                         image_ms=image_ms, generate_ms=generate_ms, status=status,
-                         ttft_ms=metrics.get("ttft_ms"),
-                         generation_tokens=metrics.get("generation_tokens"))
-            print(f"{qa_id}: {status} ({sum(r['status'] == 'valid' for r in records.values())}/{len(targets)} valid)", flush=True)
-            if status != "valid" and fail_fast:
+            timer.record_batch(
+                batch_ms=(time.perf_counter() - image_started) * 1000.0,
+                image_ms=0.0,
+                generate_ms=metrics.get("e2e_ms") or 0.0,
+                size=len(batch),
+                ttft_ms=metrics.get("ttft_ms"),
+                generation_tokens=metrics.get("generation_tokens") or 0,
+            )
+            if fail_fast and any(records[q["qa_id"]]["status"] != "valid" for q in batch):
                 break
         ordered = [records[q] for q in target_ids if q in records]
         atomic_write(output / "checkpoint.jsonl", _jsonl(ordered))

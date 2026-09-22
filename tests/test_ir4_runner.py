@@ -97,6 +97,93 @@ def test_latency_survives_a_failed_request(project):
     assert result["latency"]["steady_state_valid_rate"] == 0.0
 
 
+class BatchBackend:
+    """Records generate_batch calls and answers per allowed space."""
+
+    def __init__(self, answers):
+        self.calls = []
+
+    def generate_batch(self, batch, *, max_new_tokens):
+        self.calls.append([prompt for _, prompt, _ in batch])
+        return [allowed[0] for _, _, allowed in batch]
+
+    def metadata(self):
+        return {"backend": "BATCH_SIMULATION"}
+
+
+def test_batched_runner_records_batch_view(project):
+    """max_num_seqs>1 routes through generate_batch and reports a batch view."""
+    config, source = setup_run(project)
+    backend = BatchBackend([])
+    result = run(config, source, backend, engine="vllm",
+                 engine_options={"max_num_seqs": 2})
+
+    assert result["status"] == "PASS"
+    # Two requests at batch size 2 -> exactly one engine call.
+    assert len(backend.calls) == 1
+    latency = result["latency"]
+    assert latency["batched"] is True
+    batch = latency["batch"]
+    assert batch["batches"] == 1
+    assert batch["requests"] == 2
+    assert batch["batch_sizes"] == [2]
+    assert batch["amortized_ms_per_request"] is not None
+    assert batch["throughput_rps"] > 0
+    # The batch is the timing unit; per-request phases are not fabricated.
+    assert latency["requests"] == 0
+
+
+def test_batched_runner_chunks_oversized_batches(project):
+    config, source = setup_run(project)
+    backend = BatchBackend([])
+    result = run(config, source, backend, engine="vllm",
+                 engine_options={"max_num_seqs": 3})
+
+    assert result["status"] == "PASS"
+    # Two requests with batch size 3 -> one batch, one call.
+    assert len(backend.calls) == 1
+
+
+def test_batch_size_one_keeps_the_sequential_path(project):
+    """The default must not route through generate_batch."""
+    config, source = setup_run(project)
+    backend = FakeBackend(["A", "B"])
+    result = run(config, source, backend, engine="vllm",
+                 engine_options={"max_num_seqs": 1})
+
+    assert result["status"] == "PASS"
+    assert result["latency"]["batched"] is False
+    assert result["latency"]["requests"] == 2
+
+
+def test_sequential_backend_rejects_batched_engine_options(project):
+    """A backend without generate_batch must be refused up front."""
+    config, source = setup_run(project)
+    with pytest.raises(ValueError, match="does not support batched submission"):
+        run(config, source, FakeBackend(["A", "B"]), engine="vllm",
+            engine_options={"max_num_seqs": 2})
+
+
+def test_batched_invalid_answer_fails_the_run(project):
+    """An invalid answer is not an exception: the run fails, run_error stays None."""
+    config, source = setup_run(project)
+
+    class BadBatch:
+        def generate_batch(self, batch, *, max_new_tokens):
+            # First answer violates the constrained space; the second is valid.
+            return ["not-an-answer"] + [allowed[0] for _, _, allowed in batch[1:]]
+
+        def metadata(self):
+            return {"backend": "BATCH_BAD"}
+
+    result = run(config, source, BadBatch(), engine="vllm",
+                 engine_options={"max_num_seqs": 2})
+    assert result["status"] == "FAIL"
+    assert result["error"] is None          # same as the sequential path
+    assert result["counts"]["invalid"] == 1
+    assert result["counts"]["valid"] == 1
+
+
 def test_interruption_and_stable_limit(project):
     config, source = setup_run(project)
     backend = FakeBackend(["A", KeyboardInterrupt()])
