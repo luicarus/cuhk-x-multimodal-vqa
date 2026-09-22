@@ -5,6 +5,7 @@ import shutil
 from pathlib import Path
 
 import pytest
+from PIL import Image
 
 from test_cached_inputs import project  # small, self-contained CPU fixture
 from cuhkx.config import InputError, load_config
@@ -109,6 +110,74 @@ class BatchBackend:
 
     def metadata(self):
         return {"backend": "BATCH_SIMULATION"}
+
+
+def test_vllm_generate_batch_constrains_each_request_separately():
+    """A shared SamplingParams would let one request emit another's answers.
+
+    The answer space is per request: a single-choice item allows A-D while an
+    ordered multi-select allows sequences like ABCD. Passing one shared
+    constraint also breaks pydantic validation, since choice takes a flat list
+    of strings rather than one list per request.
+    """
+    from cuhkx.inference.qwen35_vllm import Qwen35VLLMBackend
+
+    captured = {}
+
+    class StructuredOutputsParams:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    class SamplingParams:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    class Output:
+        text = "A"
+
+    class Result:
+        outputs = [Output()]
+        metrics = None
+
+    class Engine:
+        def chat(self, conversations, sampling_params=None, **kwargs):
+            captured["conversations"] = conversations
+            captured["params"] = sampling_params
+            # Answer from each request's own allowed space, proving the pairing.
+            return [Result() for _ in conversations]
+
+    backend = Qwen35VLLMBackend.__new__(Qwen35VLLMBackend)
+    backend.SamplingParams = SamplingParams
+    backend.StructuredOutputsParams = StructuredOutputsParams
+    backend.engine = Engine()
+    backend.adapter_request = None
+    backend.image_size = 280
+    backend.tensor_parallel_size = 2
+    backend.attention_backend = "TRITON_ATTN"
+    backend.max_num_seqs = 32
+    backend.last_metrics = {"reported": False}
+
+    single = ("A", "B", "C", "D")
+    multi = ("ABCD", "ABDC", "BACD")
+    images = [Image.new("RGB", (280, 280)) for _ in range(8)]
+    batch = [(images[i*2:i*2+2] + images[i*2:i*2+2], "prompt", single if i == 0 else multi)
+             for i in range(2)]
+    try:
+        answers = backend.generate_batch(batch, max_new_tokens=8)
+    finally:
+        for image in images:
+            image.close()
+
+    assert answers == ["A", "A"]      # stub text; the constraint pairing is the assertion
+    # One parameter set per request, not one shared object.
+    assert isinstance(captured["params"], list) and len(captured["params"]) == 2
+    first, second = captured["params"]
+    assert first.kwargs["structured_outputs"].kwargs["choice"] == list(single)
+    assert second.kwargs["structured_outputs"].kwargs["choice"] == list(multi)
+    # Each choice must be a flat list of strings, never a nested list.
+    for item in captured["params"]:
+        for value in item.kwargs["structured_outputs"].kwargs["choice"]:
+            assert isinstance(value, str)
 
 
 def test_batched_runner_records_batch_view(project):

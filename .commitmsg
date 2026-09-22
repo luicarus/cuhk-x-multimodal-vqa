@@ -1,0 +1,16 @@
+﻿Constrain each batched request with its own answer space
+
+The batched call built one SamplingParams with a nested choice list - one
+candidate list per request - which pydantic rejected outright: choice is a flat
+list of strings. Fixing the shape alone would still have been wrong, because a
+shared constraint would let a single-choice item emit an ordered multi-select
+sequence from another request's space.
+
+Build one SamplingParams per request and pass the sequence to engine.chat, which
+pairs parameters with prompts one by one. Add a test that drives generate_batch
+with a single-choice item and an ordered multi-select in the same batch and
+asserts each request receives its own choice list with flat string entries;
+confirmed it fails against the shared-constraint code.
+
+Package digests change; re-run the packaging command to obtain the new
+manifest_sha256.

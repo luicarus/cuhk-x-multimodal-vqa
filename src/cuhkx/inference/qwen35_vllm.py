@@ -305,14 +305,23 @@ class Qwen35VLLMBackend:
             conversations.append([{"role": "user", "content": content}])
         self.last_encode_seconds = time.perf_counter() - encode_started
 
-        parameters = self.SamplingParams(
-            temperature=0.0,
-            top_p=1.0,
-            max_tokens=max_new_tokens,
-            skip_special_tokens=True,
-            structured_outputs=self.StructuredOutputsParams(
-                choice=[list(outputs) for _, _, outputs in batch]),
-        )
+        # One SamplingParams per request: the answer spaces differ (single choice
+        # versus ordered multi-select), and one shared constraint would let a
+        # request emit another request's answers. engine.chat pairs a sequence of
+        # parameters with the prompts one by one.
+        parameters = [
+            self.SamplingParams(
+                temperature=0.0,
+                top_p=1.0,
+                max_tokens=max_new_tokens,
+                skip_special_tokens=True,
+                # ``choice`` takes literal answer strings; a regex would be
+                # escaped into the grammar and the model would answer with the
+                # literal pattern characters.
+                structured_outputs=self.StructuredOutputsParams(choice=list(outputs)),
+            )
+            for _, _, outputs in batch
+        ]
         started = time.perf_counter()
         results = self.engine.chat(
             conversations,
