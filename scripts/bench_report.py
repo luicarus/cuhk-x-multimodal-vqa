@@ -155,17 +155,36 @@ def _fmt(value, width, places=3):
     return text.rjust(width)
 
 
+def discover_runs(outputs: Path) -> list:
+    """Find every finished run at any depth, as paths relative to --outputs.
+
+    Runs are frequently grouped into folders for tidiness (for example all
+    qwen35_4b variants under one directory). A single-level glob silently missed
+    those, so discovery recurses and identifies each run by its relative path --
+    a bare directory name would collide when two groups contain the same run id.
+    """
+    found = []
+    for summary in sorted(outputs.rglob("run_summary.json")):
+        relative = summary.parent.relative_to(outputs)
+        if str(relative) == ".":
+            continue
+        found.append(relative.as_posix())
+    return found
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--outputs", type=Path, default=PROJECT / "outputs")
-    parser.add_argument("--runs", nargs="*", help="run ids; defaults to all runs with a summary")
+    parser.add_argument("--runs", nargs="*",
+                        help="run ids (relative to --outputs, e.g. group/run); "
+                             "defaults to every run found at any depth")
     parser.add_argument("--baseline", help="run id to diff predictions against")
     parser.add_argument("--json", type=Path, help="also write the collected metrics here")
     args = parser.parse_args()
 
     outputs = args.outputs.resolve()
-    run_ids = args.runs or sorted(path.parent.name for path in outputs.glob("*/run_summary.json"))
+    run_ids = args.runs or discover_runs(outputs)
     if not run_ids:
         print(f"no finished runs under {outputs}")
         return 1
@@ -177,17 +196,17 @@ def main() -> int:
         except ValueError as error:
             print(f"skipping {run_id}: {error}")
 
-    print(f"{'run':<22} {'engine':<13} {'dataset':<8} {'N':>5} {'ran':>5} {'valid':>6} "
+    print(f"{'run':<34} {'engine':<13} {'dataset':<8} {'N':>5} {'ran':>5} {'valid':>6} "
           f"{'load_s':>8} {'infer_s':>9} {'s/req':>8} {'req/s':>8}")
-    print("-" * 108)
+    print("-" * 120)
     for run in runs:
         if not run["measured"]:
             # Say why instead of printing a throughput computed from nothing.
-            print(f"{run['run_id']:<22} {run['engine']:<13} {run['dataset']:<8} "
+            print(f"{run['run_id']:<34} {run['engine']:<13} {run['dataset']:<8} "
                   f"{run['requests']:>5} {run['executed']:>5} {run['valid']:>6} "
                   f"{'-':>8} {'-':>9} {'-':>8} {'-':>8}   (resumed; nothing executed)")
             continue
-        print(f"{run['run_id']:<22} {run['engine']:<13} {run['dataset']:<8} "
+        print(f"{run['run_id']:<34} {run['engine']:<13} {run['dataset']:<8} "
               f"{run['requests']:>5} {run['executed']:>5} {run['valid']:>6} "
               f"{run['load_seconds']:>8.1f} {run['inference_seconds']:>9.1f} "
               f"{_fmt(run['seconds_per_request'], 8)} {_fmt(run['requests_per_second'], 8)}")
@@ -195,46 +214,46 @@ def main() -> int:
     with_latency = [run for run in runs if run["latency"].get("requests")]
     if with_latency:
         print("\nlatency per request (ms)")
-        print(f"{'run':<22} {'warmup':>7} {'p50':>9} {'p90':>9} {'p95':>9} {'p99':>9} "
+        print(f"{'run':<34} {'warmup':>7} {'p50':>9} {'p90':>9} {'p95':>9} {'p99':>9} "
               f"{'max':>9} {'steady r/s':>11}")
-        print("-" * 100)
+        print("-" * 120)
         for run in with_latency:
             whole = run["latency"]["latency_ms"]["total_ms"]
             steady = run["latency"]["steady_state_ms"]["total_ms"]
-            print(f"{run['run_id']:<22} {run['latency'].get('warmup_skipped', 0):>7} "
+            print(f"{run['run_id']:<34} {run['latency'].get('warmup_skipped', 0):>7} "
                   f"{_fmt(steady.get('p50'), 9)} {_fmt(steady.get('p90'), 9)} "
                   f"{_fmt(steady.get('p95'), 9)} {_fmt(steady.get('p99'), 9)} "
                   f"{_fmt(whole.get('max_ms'), 9)} "
                   f"{_fmt(run['latency'].get('steady_state_throughput_rps'), 11)}")
 
         print("\nphase breakdown, steady state (mean ms, share of request)")
-        print(f"{'run':<22} {'image':>10} {'generate':>10} {'overhead':>10} {'total':>10}")
-        print("-" * 100)
+        print(f"{'run':<34} {'image':>10} {'generate':>10} {'overhead':>10} {'total':>10}")
+        print("-" * 120)
         for run in with_latency:
             steady = run["latency"]["steady_state_ms"]
             total = steady["total_ms"]
             share = total.get("share") or {}
-            print(f"{run['run_id']:<22} "
+            print(f"{run['run_id']:<34} "
                   f"{_fmt(steady['image_ms'].get('mean_ms'), 10)} "
                   f"{_fmt(steady['generate_ms'].get('mean_ms'), 10)} "
                   f"{_fmt(steady['overhead_ms'].get('mean_ms'), 10)} "
                   f"{_fmt(total.get('mean_ms'), 10)}")
-            print(f"{'':<22} "
+            print(f"{'':<34} "
                   f"{_fmt(share.get('image_ms'), 10, 3)} "
                   f"{_fmt(share.get('generate_ms'), 10, 3)} "
                   f"{_fmt(share.get('overhead_ms'), 10, 3)}")
 
         print("\ntime to first token (ms)")
-        print(f"{'run':<22} {'coverage':>9} {'p50':>9} {'p90':>9} {'p95':>9} {'p99':>9} "
+        print(f"{'run':<34} {'coverage':>9} {'p50':>9} {'p90':>9} {'p95':>9} {'p99':>9} "
               f"{'token/s':>9}")
-        print("-" * 100)
+        print("-" * 120)
         for run in with_latency:
             ttft = run["latency"].get("steady_state_ttft_ms") or {}
             if not ttft.get("reported_by_engine"):
-                print(f"{run['run_id']:<22} {'-':>9} engine does not report a first-token "
+                print(f"{run['run_id']:<34} {'-':>9} engine does not report a first-token "
                       f"timestamp (single blocking call)")
                 continue
-            print(f"{run['run_id']:<22} {_fmt(ttft.get('coverage'), 9)} "
+            print(f"{run['run_id']:<34} {_fmt(ttft.get('coverage'), 9)} "
                   f"{_fmt(ttft.get('p50'), 9)} {_fmt(ttft.get('p90'), 9)} "
                   f"{_fmt(ttft.get('p95'), 9)} {_fmt(ttft.get('p99'), 9)} "
                   f"{_fmt(run['latency'].get('steady_state_token_rate'), 9)}")
@@ -242,14 +261,14 @@ def main() -> int:
     memory_runs = [run for run in runs if (run.get("gpu_memory") or {}).get("after")]
     if memory_runs:
         print("\ngpu memory per device (MiB), sampled from the parent process")
-        print(f"{'run':<22} {'dev':>4} {'name':<16} {'total':>9} {'used':>9} {'free':>9} "
+        print(f"{'run':<34} {'dev':>4} {'name':<16} {'total':>9} {'used':>9} {'free':>9} "
               f"{'alloc':>9} {'reserved':>9} {'peak_alloc':>11}")
-        print("-" * 112)
+        print("-" * 120)
         for run in memory_runs:
             memory = run["gpu_memory"]
             for device, values in sorted(memory["after"].items()):
                 peak = (memory.get("peaks") or {}).get(device, {})
-                print(f"{run['run_id']:<22} {device:>4} {values.get('name', '?')[:16]:<16} "
+                print(f"{run['run_id']:<34} {device:>4} {values.get('name', '?')[:16]:<16} "
                       f"{_fmt(values.get('total_mib'), 9, 1)} {_fmt(values.get('used_mib'), 9, 1)} "
                       f"{_fmt(values.get('free_mib'), 9, 1)} {_fmt(values.get('allocated_mib'), 9, 1)} "
                       f"{_fmt(values.get('reserved_mib'), 9, 1)} "
@@ -258,18 +277,18 @@ def main() -> int:
             if before:
                 deltas = [f"dev{d}: {before[d]['used_mib']:.0f}->{memory['after'][d]['used_mib']:.0f} MiB"
                           for d in sorted(before) if d in memory["after"]]
-                print(f"{'':<22} growth during run: {'; '.join(deltas)}")
+                print(f"{'':<34} growth during run: {'; '.join(deltas)}")
 
     worker_runs = [run for run in runs
                    if ((run.get("backend_metadata") or {}).get("workers") or {}).get("workers")]
     if worker_runs:
         print("\ngpu memory per vLLM worker process (MiB), sampled inside each worker")
-        print(f"{'run':<22} {'dev':>4} {'used':>9} {'free':>9} {'alloc':>9} {'reserved':>9} "
+        print(f"{'run':<34} {'dev':>4} {'used':>9} {'free':>9} {'alloc':>9} {'reserved':>9} "
               f"{'peak_alloc':>11} {'kv_cache':>10} {'kv_tokens':>10}")
-        print("-" * 112)
+        print("-" * 120)
         for run in worker_runs:
             for worker in run["backend_metadata"]["workers"]["workers"]:
-                print(f"{run['run_id']:<22} {worker.get('device_index', '?'):>4} "
+                print(f"{run['run_id']:<34} {worker.get('device_index', '?'):>4} "
                       f"{_fmt(worker.get('used_mib'), 9, 1)} {_fmt(worker.get('free_mib'), 9, 1)} "
                       f"{_fmt(worker.get('allocated_mib'), 9, 1)} "
                       f"{_fmt(worker.get('reserved_mib'), 9, 1)} "
@@ -278,7 +297,7 @@ def main() -> int:
                       f"{_fmt(worker.get('kv_cache_tokens'), 10)}")
             error = run["backend_metadata"]["workers"].get("error")
             if error:
-                print(f"{'':<22} worker telemetry error: {error}")
+                print(f"{'':<34} worker telemetry error: {error}")
 
     if args.baseline:
         base = next((run for run in runs if run["run_id"] == args.baseline), None)
@@ -286,8 +305,8 @@ def main() -> int:
             print(f"\nbaseline run not found: {args.baseline}")
         else:
             print(f"\noutput agreement against {args.baseline}")
-            print(f"{'run':<22} {'shared':>7} {'identical':>10} {'agreement':>10}")
-            print("-" * 100)
+            print(f"{'run':<34} {'shared':>7} {'identical':>10} {'agreement':>10}")
+            print("-" * 120)
             for run in runs:
                 if run["run_id"] == args.baseline:
                     continue
@@ -297,9 +316,9 @@ def main() -> int:
                                ((base["run_id"], base["predictions"]), (run["run_id"], run["predictions"]))
                                if not value]
                     detail = f" (no predictions in {', '.join(missing)})" if missing else ""
-                    print(f"{run['run_id']:<22} {'-':>7} no overlapping predictions{detail}")
+                    print(f"{run['run_id']:<34} {'-':>7} no overlapping predictions{detail}")
                     continue
-                print(f"{run['run_id']:<22} {result['shared']:>7} {result['identical']:>10} "
+                print(f"{run['run_id']:<34} {result['shared']:>7} {result['identical']:>10} "
                       f"{result['agreement']:>10.4f}")
                 if result["differing"]:
                     print(f"    first differing: {', '.join(result['differing'])}")

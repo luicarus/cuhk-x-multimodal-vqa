@@ -243,6 +243,35 @@ def test_report_reads_engine_identity_from_the_contract(tmp_path):
     assert "transformers" in hf_line
 
 
+def test_report_finds_runs_nested_in_group_folders(tmp_path):
+    """Runs are often grouped into folders; a single-level glob missed them."""
+    rows = [("p1", "A")]
+    _write_run(tmp_path, "group/hf", elapsed=10.0, load=0.0, resumed=0, rows=rows,
+               engine="transformers")
+    _write_run(tmp_path, "group/vllm_v1", elapsed=5.0, load=1.0, resumed=0, rows=rows,
+               engine="vllm")
+    # A run at the top level must still be found alongside the grouped ones.
+    _write_run(tmp_path, "standalone", elapsed=10.0, load=0.0, resumed=0, rows=rows)
+
+    result = _report(tmp_path)
+    assert result.returncode == 0, result.stderr
+    # Identified by relative path, so same-named runs in different groups do not
+    # collapse into one row.
+    assert "group/hf" in result.stdout
+    assert "group/vllm_v1" in result.stdout
+    assert "standalone" in result.stdout
+
+
+def test_report_baseline_accepts_a_nested_run_id(tmp_path):
+    rows = [("p1", "A"), ("p2", "B"), ("p3", "C"), ("p4", "D")]
+    _write_run(tmp_path, "group/hf", elapsed=10.0, load=0.0, resumed=0, rows=rows)
+    _write_run(tmp_path, "group/vllm", elapsed=10.0, load=0.0, resumed=0, rows=rows)
+
+    result = _report(tmp_path, "--baseline", "group/hf")
+    assert result.returncode == 0, result.stderr
+    assert "1.0000" in result.stdout
+
+
 def test_report_measures_throughput_and_flags_fully_resumed_runs(tmp_path):
     rows = [("p1", "A"), ("p2", "B"), ("p3", "A"), ("p4", "C")]
     _write_run(tmp_path, "measured", elapsed=100.0, load=20.0, resumed=0, rows=rows)
