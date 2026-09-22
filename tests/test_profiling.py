@@ -191,7 +191,8 @@ def test_summary_latency_is_not_part_of_the_verified_contract():
 
 
 def _write_run(root: Path, run_id: str, *, elapsed: float, load: float, resumed: int,
-               rows: list[tuple[str, str]], latency: dict | None = None) -> None:
+               rows: list[tuple[str, str]], latency: dict | None = None,
+               engine: str = "vllm", dataset: str = "pilot") -> None:
     directory = root / run_id
     directory.mkdir(parents=True)
     backend = {"backend": "test_backend", "load_seconds": load, "versions": {}}
@@ -199,13 +200,15 @@ def _write_run(root: Path, run_id: str, *, elapsed: float, load: float, resumed:
         "status": "PASS", "signature": "s", "target_ids": [qa for qa, _ in rows],
         "counts": {"valid": len(rows), "invalid": 0, "failed": 0, "pending": 0},
         "resumed_valid": resumed, "elapsed_seconds": elapsed, "backend": backend,
-        "engine": "vllm", "engine_options": {},
     }
     if latency is not None:
         summary["latency"] = latency
     (directory / "run_summary.json").write_text(json.dumps(summary), encoding="utf-8")
+    # Engine identity lives in the signed contract, not in the summary.
     (directory / "resume_state.json").write_text(
-        json.dumps({"contract": {"dataset": "pilot"}}), encoding="utf-8")
+        json.dumps({"contract": {"dataset": dataset, "engine": engine,
+                                 "engine_options": {"attention_backend": "TRITON_ATTN"}}}),
+        encoding="utf-8")
     with (directory / "predictions.csv").open("w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle, lineterminator="\n")
         writer.writerow(["qa_id", "prediction"])
@@ -217,6 +220,27 @@ def _report(tmp_path, *args):
         [sys.executable, "-B", str(PROJECT / "scripts/bench_report.py"),
          "--outputs", str(tmp_path), *args],
         capture_output=True, text=True, encoding="utf-8", cwd=PROJECT)
+
+
+def test_report_reads_engine_identity_from_the_contract(tmp_path):
+    """Engine identity lives in resume_state.contract, not run_summary.json.
+
+    Reading only the summary silently labelled every vLLM run as "transformers",
+    which is exactly the column the comparison turns on.
+    """
+    rows = [("p1", "A")]
+    _write_run(tmp_path, "vllm_run", elapsed=10.0, load=0.0, resumed=0, rows=rows,
+               engine="vllm")
+    _write_run(tmp_path, "hf_run", elapsed=10.0, load=0.0, resumed=0, rows=rows,
+               engine="transformers")
+
+    result = _report(tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert "vllm_run" in result.stdout and "hf_run" in result.stdout
+    vllm_line = next(l for l in result.stdout.splitlines() if l.startswith("vllm_run"))
+    hf_line = next(l for l in result.stdout.splitlines() if l.startswith("hf_run"))
+    assert "vllm" in vllm_line
+    assert "transformers" in hf_line
 
 
 def test_report_measures_throughput_and_flags_fully_resumed_runs(tmp_path):

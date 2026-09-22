@@ -25,6 +25,22 @@ from pathlib import Path
 PROJECT = Path(__file__).resolve().parents[1]
 
 
+def read_contract(root: Path) -> dict:
+    """Read the signed contract, which is where engine identity actually lives.
+
+    run_summary.json carries results and backend metadata but not the engine
+    name; that is in resume_state.contract. Reading only the summary silently
+    labelled every vLLM run as "transformers".
+    """
+    state = root / "resume_state.json"
+    if not state.is_file():
+        return {}
+    try:
+        return json.loads(state.read_text(encoding="utf-8")).get("contract") or {}
+    except (ValueError, OSError):
+        return {}
+
+
 def load_run(outputs: Path, run_id: str) -> dict:
     root = outputs / run_id
     summary_path = root / "run_summary.json"
@@ -32,6 +48,7 @@ def load_run(outputs: Path, run_id: str) -> dict:
         raise ValueError(f"run has no run_summary.json: {run_id}")
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
     backend = summary.get("backend") or {}
+    contract = read_contract(root)
     targets = summary.get("target_ids") or []
     counts = summary.get("counts") or {}
     # Prefer predictions.csv, but a run that never exported it still has the same
@@ -52,10 +69,10 @@ def load_run(outputs: Path, run_id: str) -> dict:
     measured = executed > 0 and bool(backend) and backend.get("backend") != ""
     return {
         "run_id": run_id,
-        "engine": summary.get("engine", "transformers"),
-        "engine_options": summary.get("engine_options") or {},
+        "engine": contract.get("engine") or summary.get("engine") or "transformers",
+        "engine_options": contract.get("engine_options") or summary.get("engine_options") or {},
         "backend": backend.get("backend", "?"),
-        "dataset": (summary.get("signature") and "see_resume_state") or "?",
+        "dataset": contract.get("dataset") or "?",
         "requests": len(targets),
         "executed": executed,
         "measured": measured,
@@ -114,16 +131,6 @@ def read_targets(path: Path) -> dict:
     return predictions
 
 
-def dataset_of(outputs: Path, run_id: str) -> str:
-    state = outputs / run_id / "resume_state.json"
-    if not state.is_file():
-        return "?"
-    try:
-        return json.loads(state.read_text(encoding="utf-8"))["contract"]["dataset"]
-    except (KeyError, ValueError, OSError):
-        return "?"
-
-
 def agreement(left: dict, right: dict) -> dict:
     """Compare two runs request by request on the shared target set."""
     shared = sorted(set(left["predictions"]) & set(right["predictions"]))
@@ -173,7 +180,6 @@ def main() -> int:
           f"{'load_s':>8} {'infer_s':>9} {'s/req':>8} {'req/s':>8}")
     print("-" * 108)
     for run in runs:
-        run["dataset"] = dataset_of(outputs, run["run_id"])
         if not run["measured"]:
             # Say why instead of printing a throughput computed from nothing.
             print(f"{run['run_id']:<22} {run['engine']:<13} {run['dataset']:<8} "
