@@ -70,6 +70,7 @@ def load_run(outputs: Path, run_id: str) -> dict:
         "seconds_per_request": round(inference_seconds / len(targets), 4) if targets else None,
         "requests_per_second": round(len(targets) / inference_seconds, 4) if inference_seconds else None,
         "latency": summary.get("latency") or {},
+        "gpu_memory": summary.get("gpu_memory") or {},
         "tensor_parallel_size": backend.get("tensor_parallel_size"),
         "attention_backend": backend.get("attention_backend"),
         "versions": backend.get("versions") or {},
@@ -215,6 +216,42 @@ def main() -> int:
                   f"{_fmt(share.get('image_ms'), 10, 3)} "
                   f"{_fmt(share.get('generate_ms'), 10, 3)} "
                   f"{_fmt(share.get('overhead_ms'), 10, 3)}")
+
+        print("\ntime to first token (ms)")
+        print(f"{'run':<22} {'coverage':>9} {'p50':>9} {'p90':>9} {'p95':>9} {'p99':>9} "
+              f"{'token/s':>9}")
+        print("-" * 100)
+        for run in with_latency:
+            ttft = run["latency"].get("steady_state_ttft_ms") or {}
+            if not ttft.get("reported_by_engine"):
+                print(f"{run['run_id']:<22} {'-':>9} engine does not report a first-token "
+                      f"timestamp (single blocking call)")
+                continue
+            print(f"{run['run_id']:<22} {_fmt(ttft.get('coverage'), 9)} "
+                  f"{_fmt(ttft.get('p50'), 9)} {_fmt(ttft.get('p90'), 9)} "
+                  f"{_fmt(ttft.get('p95'), 9)} {_fmt(ttft.get('p99'), 9)} "
+                  f"{_fmt(run['latency'].get('steady_state_token_rate'), 9)}")
+
+    memory_runs = [run for run in runs if (run.get("gpu_memory") or {}).get("after")]
+    if memory_runs:
+        print("\ngpu memory per device (MiB), sampled while the engine was resident")
+        print(f"{'run':<22} {'dev':>4} {'name':<16} {'total':>9} {'used':>9} {'free':>9} "
+              f"{'alloc':>9} {'reserved':>9} {'peak_alloc':>11}")
+        print("-" * 112)
+        for run in memory_runs:
+            memory = run["gpu_memory"]
+            for device, values in sorted(memory["after"].items()):
+                peak = (memory.get("peaks") or {}).get(device, {})
+                print(f"{run['run_id']:<22} {device:>4} {values.get('name', '?')[:16]:<16} "
+                      f"{_fmt(values.get('total_mib'), 9, 1)} {_fmt(values.get('used_mib'), 9, 1)} "
+                      f"{_fmt(values.get('free_mib'), 9, 1)} {_fmt(values.get('allocated_mib'), 9, 1)} "
+                      f"{_fmt(values.get('reserved_mib'), 9, 1)} "
+                      f"{_fmt(peak.get('peak_allocated_mib'), 11, 1)}")
+            before = memory.get("before") or {}
+            if before:
+                deltas = [f"dev{d}: {before[d]['used_mib']:.0f}->{memory['after'][d]['used_mib']:.0f} MiB"
+                          for d in sorted(before) if d in memory["after"]]
+                print(f"{'':<22} growth during run: {'; '.join(deltas)}")
 
     if args.baseline:
         base = next((run for run in runs if run["run_id"] == args.baseline), None)

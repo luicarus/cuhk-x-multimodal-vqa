@@ -58,6 +58,124 @@ def test_request_timer_rejects_negative_durations():
     timer = RequestTimer()
     with pytest.raises(ValueError):
         timer.record("q", total_ms=-1.0, image_ms=0.0, generate_ms=0.0, status="valid")
+    with pytest.raises(ValueError):
+        timer.record("q", total_ms=1.0, image_ms=0.0, generate_ms=0.0, status="valid",
+                     ttft_ms=-0.5)
+
+
+def test_ttft_is_only_averaged_over_requests_that_reported_it():
+    """Counting silent backends as zero TTFT would report a flattering figure."""
+    timer = RequestTimer(warmup=0)
+    timer.record("q1", total_ms=100.0, image_ms=10.0, generate_ms=80.0, status="valid",
+                 ttft_ms=60.0, generation_tokens=1)
+    timer.record("q2", total_ms=100.0, image_ms=10.0, generate_ms=80.0, status="valid")
+    summary = timer.summary()
+
+    ttft = summary["ttft_ms"]
+    assert ttft["reported_by_engine"] is True
+    assert ttft["count"] == 1
+    assert ttft["p50"] == 60.0        # not averaged down toward 0 by the silent request
+    assert ttft["coverage"] == 0.5    # and the gap is visible
+    assert summary["generation_tokens"] == 1
+
+
+def test_ttft_is_absent_when_no_backend_reports_it():
+    timer = RequestTimer(warmup=0)
+    timer.record("q1", total_ms=100.0, image_ms=10.0, generate_ms=80.0, status="valid")
+    ttft = timer.summary()["ttft_ms"]
+    assert ttft == {"count": 0, "reported_by_engine": False}
+
+
+def test_token_rate_uses_only_reported_tokens():
+    timer = RequestTimer(warmup=0)
+    timer.record("q1", total_ms=1000.0, image_ms=0.0, generate_ms=900.0, status="valid",
+                 generation_tokens=2)
+    timer.record("q2", total_ms=1000.0, image_ms=0.0, generate_ms=900.0, status="valid",
+                 generation_tokens=2)
+    # 4 tokens over 2 seconds.
+    assert timer.summary()["steady_state_token_rate"] == 2.0
+
+
+def test_request_metrics_handles_a_backend_without_engine_timing():
+    from cuhkx.inference.profiling import request_metrics
+
+    class Silent:
+        pass
+
+    class ExplicitlySilent:
+        last_metrics = {"reported": False}
+
+    assert request_metrics(Silent()) == {}
+    assert request_metrics(ExplicitlySilent()) == {}
+
+    class Reporting:
+        last_metrics = {"reported": True, "first_token_latency": 0.25,
+                        "num_generation_tokens": 1, "num_prompt_tokens": 909,
+                        "e2e_latency": 0.5}
+
+    metrics = request_metrics(Reporting())
+    assert metrics["ttft_ms"] == 250.0          # seconds -> milliseconds
+    assert metrics["generation_tokens"] == 1
+    assert metrics["prompt_tokens"] == 909
+    assert metrics["e2e_ms"] == 500.0
+
+
+def test_memory_sampling_degrades_without_cuda():
+    """Profiling must never be the reason a prediction run fails."""
+    from cuhkx.inference.profiling import gpu_memory_peak_snapshot, sample_gpu_memory
+
+    assert sample_gpu_memory(None) == {}
+    assert gpu_memory_peak_snapshot(None) == {}
+
+    class BrokenCuda:
+        class cuda:
+            @staticmethod
+            def is_available():
+                raise RuntimeError("no driver")
+
+    assert sample_gpu_memory(BrokenCuda()) == {}
+
+
+def test_memory_snapshot_reports_each_device():
+    from cuhkx.inference.profiling import gpu_memory_snapshot
+
+    class FakeCuda:
+        @staticmethod
+        def is_available():
+            return True
+
+        @staticmethod
+        def device_count():
+            return 2
+
+        @staticmethod
+        def get_device_name(index):
+            return f"Tesla T4 #{index}"
+
+        @staticmethod
+        def mem_get_info(index):
+            # device 1 already has more in use: an imbalance must be visible
+            used = (2 * 1024**3, 6 * 1024**3)[index]
+            return (16 * 1024**3 - used, 16 * 1024**3)
+
+        @staticmethod
+        def memory_allocated(index):
+            return 1024**3
+
+        @staticmethod
+        def memory_reserved(index):
+            return 2 * 1024**3
+
+    class Torch:
+        cuda = FakeCuda()
+
+    snapshot = gpu_memory_snapshot(Torch())
+    assert set(snapshot) == {"0", "1"}
+    assert snapshot["0"]["total_mib"] == 16384.0
+    assert snapshot["0"]["used_mib"] == 2048.0
+    assert snapshot["1"]["used_mib"] == 6144.0
+    assert snapshot["0"]["allocated_mib"] == 1024.0
+    assert snapshot["0"]["reserved_mib"] == 2048.0
 
 
 def test_summary_latency_is_not_part_of_the_verified_contract():

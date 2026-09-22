@@ -14,13 +14,27 @@ from cuhkx.config import inside, require
 from cuhkx.data.inputs import load_qa, pending_targets, select_targets
 from cuhkx.data.validate import check_inputs, fingerprint, sha256
 from cuhkx.evaluation.metric import available_option_letters
-from cuhkx.inference.profiling import RequestTimer
+from cuhkx.inference.profiling import (RequestTimer, gpu_memory_peak_snapshot,
+                                       request_metrics, sample_gpu_memory)
 from cuhkx.inference.prompt import (PROMPT_VERSION, allowed_answer_outputs, build_mcq_prompt,
                                     detect_prompt_leakage, parse_model_answer)
 from cuhkx.inference.storage import atomic_write, run_lock, write_json
 
 
 ARTIFACTS = ("checkpoint.jsonl", "predictions.csv", "audit.jsonl")
+
+
+def profiling_torch():
+    """Return torch if it is importable, else None.
+
+    Memory sampling is best-effort: CPU test runs and simulation backends have no
+    CUDA, and profiling must never be the reason a prediction run fails.
+    """
+    try:
+        import torch
+    except ImportError:
+        return None
+    return torch if torch.cuda.is_available() else None
 
 
 def verify_completed_run(config, run_id, prepared_input=None):
@@ -204,12 +218,18 @@ def run_predictions(config, dataset, limit, run_id, model_source, backend_factor
         if pending:
             backend = backend_factory()
         timer = RequestTimer()
+        memory_before = None
+        memory_after = None
+        memory_peaks = {}
+        if pending:
+            memory_before = sample_gpu_memory(profiling_torch())
         for qa in pending:
             qa_id = qa["qa_id"]
             images = []
             raw, prediction, error, status = "", None, None, "failed"
             request_started = time.perf_counter()
             image_ms = generate_ms = 0.0
+            metrics = {}
             try:
                 phase_started = time.perf_counter()
                 for relative in checked["selected_frames"][qa_id]:
@@ -222,6 +242,7 @@ def run_predictions(config, dataset, limit, run_id, model_source, backend_factor
                     allowed_outputs=allowed_answer_outputs(qa["category"], available_option_letters(qa)),
                     max_new_tokens=config["baseline"]["generation"]["max_new_tokens"])
                 generate_ms = (time.perf_counter() - phase_started) * 1000.0
+                metrics = request_metrics(backend)
                 require(isinstance(raw, str), "backend output must be text")
                 parsed = parse_model_answer(raw, category=qa["category"], valid_options=available_option_letters(qa))
                 if parsed.is_valid and raw in allowed_answer_outputs(qa["category"], available_option_letters(qa)):
@@ -245,7 +266,9 @@ def run_predictions(config, dataset, limit, run_id, model_source, backend_factor
             # Recorded after the checkpoint write so total_ms covers the full
             # per-request cost, including the O(n) rewrite of checkpoint.jsonl.
             timer.record(qa_id, total_ms=(time.perf_counter() - request_started) * 1000.0,
-                         image_ms=image_ms, generate_ms=generate_ms, status=status)
+                         image_ms=image_ms, generate_ms=generate_ms, status=status,
+                         ttft_ms=metrics.get("ttft_ms"),
+                         generation_tokens=metrics.get("generation_tokens"))
             print(f"{qa_id}: {status} ({sum(r['status'] == 'valid' for r in records.values())}/{len(targets)} valid)", flush=True)
             if status != "valid" and fail_fast:
                 break
@@ -253,6 +276,11 @@ def run_predictions(config, dataset, limit, run_id, model_source, backend_factor
         atomic_write(output / "checkpoint.jsonl", _jsonl(ordered))
         atomic_write(output / "predictions.csv", _predictions(ordered))
         atomic_write(output / "audit.jsonl", _jsonl(ordered))
+        if pending:
+            # Sampled while the engine is still resident: this is the figure that
+            # decides whether a larger batch fits.
+            memory_after = sample_gpu_memory(profiling_torch())
+            memory_peaks = gpu_memory_peak_snapshot(profiling_torch())
         counts = {status: sum(row["status"] == status for row in ordered) for status in ("valid", "invalid", "failed")}
         counts.update(pending=len(targets) - len(ordered), prompt_leakage=0)
         summary = {"status": "PASS" if counts["valid"] == len(targets) else "FAIL",
@@ -262,6 +290,8 @@ def run_predictions(config, dataset, limit, run_id, model_source, backend_factor
                    # contract: _verify_finished never reads it, so a metric change
                    # cannot invalidate an already finished run.
                    "latency": timer.summary(),
+                   "gpu_memory": {"before": memory_before or {}, "after": memory_after or {},
+                                  "peaks": memory_peaks},
                    "backend": backend.metadata() if backend else {"loaded_this_run": False}, "error": run_error,
                    "output_sha256": {name: sha256(output / name) for name in ARTIFACTS}}
         write_json(summary_path, summary)

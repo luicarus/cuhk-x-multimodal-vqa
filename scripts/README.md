@@ -23,14 +23,22 @@ python scripts/bench_report.py --baseline qwen35_4b_test          # 附逐条输
 python scripts/bench_report.py --json reports/bench.json          # 另存机器可读结果
 ```
 
-报告包含四类指标：
+报告包含五类指标：
 
 | 指标 | 说明 |
 |---|---|
 | 端到端吞吐 | `s/req`、`req/s`，**排除引擎加载时间**（那是可摊销的一次性成本） |
 | 延迟分布 | p50/p90/p95/p99/max，分「全量」与「稳态」两个视图 |
 | 阶段拆分 | `image_ms`（解码 4 张 JPEG）、`generate_ms`（模型调用）、`overhead_ms`（含 checkpoint 重写） |
+| TTFT | 首 token 延迟分位 + token/s；**仅 vLLM 上报**，Transformers 是单次阻塞调用没有时间戳 |
+| 显存 | 逐卡 total/used/free/allocated/reserved + 峰值，另有运行前后增长量 |
 | 输出一致性 | 与基线逐条比对的相同率，用于确认换引擎没有改变模型行为 |
+
+**关于 TTFT 的口径**：只对**真正上报了首 token 时间戳的请求**求平均，缺失的请求被排除而不是记为 0（记为 0 会得出虚高的漂亮数字），同时输出 `coverage` 说明覆盖率。在本 workload 下（`max_new_tokens=8`，答案 1~4 个 token）prefill 几乎就是全部，**TTFT 预期接近总延迟**——报告如实呈现，不假装是聊天场景的 profile。
+
+**关于显存**：同时记录驱动视角（`mem_get_info`，决定还能不能开大 batch）与分配器视角（`allocated` / `reserved`，两者差距大意味着碎片而非真缺显存，修法不同）。**逐卡记录**是因为 TP 下两卡不一定均衡，只看总量会掩盖不均衡。
+
+引擎侧指标（TTFT、token 数）通过 `backend.last_metrics` 传递；后端不上报时视为「无数据」而非 0。显存采样失败会被吞掉并返回空字典——**profiling 永远不能成为预测失败的原因**。
 
 **稳态视图跳过前 3 条请求**（`profiling.WARMUP_REQUESTS`）：首次调用包含 kernel 选择与视觉塔首次分配，混进去会低估真实吞吐。全量视图保留这段冷启动尾巴，因为那才是用户实际感受到的。
 

@@ -34,6 +34,56 @@ from cuhkx.config import require
 WARMUP_REQUESTS = 3
 
 
+def gpu_memory_snapshot(torch_module):
+    """Per-device memory in MiB, from the driver and from torch's allocator.
+
+    Both views are needed and they answer different questions. The driver figure
+    (`mem_get_info`) is what the process has taken from the card, so it is the
+    number that decides whether a larger batch will fit. The allocator figures
+    separate memory torch holds for live tensors from memory it reserved and is
+    keeping, and a large gap between the two means fragmentation rather than a
+    real shortage -- which changes the fix.
+
+    Reported per device because under tensor parallelism the two GPUs are not
+    guaranteed to be balanced, and an imbalance is invisible in a single total.
+    """
+    require(torch_module is not None, "torch is required for memory sampling")
+    require(torch_module.cuda.is_available(), "CUDA is required for memory sampling")
+    devices = {}
+    for index in range(torch_module.cuda.device_count()):
+        free_bytes, total_bytes = torch_module.cuda.mem_get_info(index)
+        devices[str(index)] = {
+            "name": torch_module.cuda.get_device_name(index),
+            "total_mib": round(total_bytes / 1024**2, 1),
+            "free_mib": round(free_bytes / 1024**2, 1),
+            "used_mib": round((total_bytes - free_bytes) / 1024**2, 1),
+            "allocated_mib": round(torch_module.cuda.memory_allocated(index) / 1024**2, 1),
+            "reserved_mib": round(torch_module.cuda.memory_reserved(index) / 1024**2, 1),
+        }
+    return devices
+
+
+def gpu_memory_peaks(torch_module):
+    """Peak allocated/reserved per device since the last reset.
+
+    Used after a warmup so the peak reflects steady-state serving rather than
+    one-off model loading, which would otherwise dominate and say nothing about
+    whether a larger batch fits.
+    """
+    peaks = {}
+    for index in range(torch_module.cuda.device_count()):
+        peaks[str(index)] = {
+            "peak_allocated_mib": round(torch_module.cuda.max_memory_allocated(index) / 1024**2, 1),
+            "peak_reserved_mib": round(torch_module.cuda.max_memory_reserved(index) / 1024**2, 1),
+        }
+    return peaks
+
+
+def reset_gpu_peaks(torch_module):
+    for index in range(torch_module.cuda.device_count()):
+        torch_module.cuda.reset_peak_memory_stats(index)
+
+
 def percentiles(values, points=(50, 90, 95, 99)):
     """Nearest-rank percentiles; no interpolation, so every value is observed."""
     ordered = sorted(float(value) for value in values)
@@ -63,6 +113,46 @@ def _describe(values):
     }
 
 
+def request_metrics(backend):
+    """Read the last request's engine-reported metrics, whatever the backend.
+
+    Backends are not required to expose timing. The Transformers path returns
+    no first-token timestamp because it generates in one blocking call, so the
+    runner must treat "absent" as a real answer rather than an error.
+    """
+    values = getattr(backend, "last_metrics", None)
+    if not isinstance(values, dict) or not values.get("reported"):
+        return {}
+    ttft = values.get("first_token_latency")
+    return {
+        "ttft_ms": None if ttft is None else float(ttft) * 1000.0,
+        "generation_tokens": values.get("num_generation_tokens"),
+        "prompt_tokens": values.get("num_prompt_tokens"),
+        "e2e_ms": None if values.get("e2e_latency") is None else float(values["e2e_latency"]) * 1000.0,
+    }
+
+
+def sample_gpu_memory(torch_module):
+    """Memory snapshot that degrades to an empty dict instead of failing a run."""
+    if torch_module is None:
+        return {}
+    try:
+        return gpu_memory_snapshot(torch_module)
+    except Exception:
+        # Profiling must never be the reason a prediction run fails.
+        return {}
+
+
+def gpu_memory_peak_snapshot(torch_module):
+    """Peak snapshot that degrades to an empty dict."""
+    if torch_module is None:
+        return {}
+    try:
+        return gpu_memory_peaks(torch_module)
+    except Exception:
+        return {}
+
+
 class RequestTimer:
     """Collect one timing sample per request and summarize the run."""
 
@@ -70,8 +160,10 @@ class RequestTimer:
         self.warmup = warmup
         self.samples = []
 
-    def record(self, qa_id, *, total_ms, image_ms, generate_ms, status):
+    def record(self, qa_id, *, total_ms, image_ms, generate_ms, status,
+               ttft_ms=None, generation_tokens=None):
         require(total_ms >= 0 and image_ms >= 0 and generate_ms >= 0, "negative duration")
+        require(ttft_ms is None or ttft_ms >= 0, "negative time to first token")
         # Python's own bookkeeping is the remainder; it cannot be measured
         # directly without distorting what is being measured.
         overhead_ms = max(0.0, total_ms - image_ms - generate_ms)
@@ -79,6 +171,8 @@ class RequestTimer:
             "qa_id": qa_id, "status": status,
             "total_ms": round(total_ms, 3), "image_ms": round(image_ms, 3),
             "generate_ms": round(generate_ms, 3), "overhead_ms": round(overhead_ms, 3),
+            "ttft_ms": None if ttft_ms is None else round(ttft_ms, 3),
+            "generation_tokens": generation_tokens,
         })
 
     def _phase(self, name, samples):
@@ -94,6 +188,26 @@ class RequestTimer:
                 for phase in ("image_ms", "generate_ms", "overhead_ms")
             }
         return described
+
+    def _ttft(self, samples):
+        """TTFT over only the requests whose engine actually reported it.
+
+        Backends differ: vLLM exposes a first-token timestamp, the Transformers
+        path does not. Counting the missing ones as zero would report a
+        flattering average, so they are excluded and the coverage is stated.
+        """
+        reported = [sample["ttft_ms"] for sample in samples if sample["ttft_ms"] is not None]
+        if not reported:
+            return {"count": 0, "reported_by_engine": False}
+        return {**_describe(reported), "reported_by_engine": True,
+                "coverage": round(len(reported) / len(samples), 4)}
+
+    def _token_rate(self, samples):
+        tokens = sum(sample["generation_tokens"] or 0 for sample in samples)
+        if not tokens:
+            return None
+        steady_ms = sum(sample["total_ms"] for sample in samples)
+        return round(tokens / (steady_ms / 1000.0), 4) if steady_ms else None
 
     def summary(self):
         if not self.samples:
@@ -115,6 +229,14 @@ class RequestTimer:
             "steady_state_throughput_rps": round(len(steady) / (steady_total / 1000.0), 4) if steady_total else 0.0,
             "steady_state_valid_rate": round(valid / len(steady), 4) if steady else 0.0,
             "run_throughput_rps": round(len(self.samples) / (whole_total / 1000.0), 4) if whole_total else 0.0,
+            # TTFT answers a different question from throughput: with an 8-token
+            # answer budget, prefill dominates and decode is a handful of steps,
+            # so TTFT is expected to sit close to total latency here. Reporting
+            # both makes that explicit instead of implying a chat-style profile.
+            "ttft_ms": self._ttft(self.samples),
+            "steady_state_ttft_ms": self._ttft(steady),
+            "steady_state_token_rate": self._token_rate(steady),
+            "generation_tokens": sum(sample["generation_tokens"] or 0 for sample in self.samples),
             "slowest_requests": sorted(
                 ({"qa_id": s["qa_id"], "total_ms": s["total_ms"], "status": s["status"]}
                  for s in self.samples), key=lambda item: item["total_ms"], reverse=True)[:5],

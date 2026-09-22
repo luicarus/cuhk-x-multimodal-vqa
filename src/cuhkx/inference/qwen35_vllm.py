@@ -194,6 +194,8 @@ class Qwen35VLLMBackend:
             mm_processor_kwargs={"use_fast": False},
         )
         self.adapter_request = None
+        # Populated per request; absent until generate() has run.
+        self.last_metrics = {"reported": False}
         if adapter is not None:
             self.adapter_request = self._register_adapter(adapter)
         self.load_seconds = time.perf_counter() - started
@@ -255,7 +257,14 @@ class Qwen35VLLMBackend:
             lora_request=self.adapter_request,
         )
         require(len(results) == 1, "vLLM returned an unexpected number of results")
-        return results[0].outputs[0].text.strip()
+        output = results[0]
+        # The engine times the request itself, which is the only way to get TTFT:
+        # the offline chat API returns the finished text, not a token stream.
+        # ``first_token_latency`` is an engine-core timestamp measured from
+        # request arrival, so it includes queueing and excludes our own image
+        # encoding -- exactly the split worth reporting.
+        self.last_metrics = _engine_metrics(output)
+        return output.outputs[0].text.strip()
 
     def metadata(self):
         import os
@@ -278,6 +287,28 @@ class Qwen35VLLMBackend:
             "versions": runtime,
             "engine_environment": {name: os.environ.get(name) for name in VLLM_ENGINE_ENV},
         }
+
+
+def _engine_metrics(output) -> dict:
+    """Extract engine-reported timing from a RequestOutput.
+
+    vLLM attaches RequestStateStats to finished requests on some versions and
+    leaves it None on others, and the field set has moved between releases. This
+    reads what is present and reports nothing rather than guessing, so a missing
+    TTFT is visible as missing instead of silently becoming zero.
+    """
+    stats = getattr(output, "metrics", None)
+    if stats is None:
+        return {"reported": False}
+    values = {}
+    for name in ("first_token_latency", "e2e_latency", "num_prompt_tokens",
+                 "num_generation_tokens", "queued_ts", "scheduled_ts"):
+        value = getattr(stats, name, None)
+        if value is not None:
+            values[name] = value
+    if not values:
+        return {"reported": False}
+    return {"reported": True, **values}
 
 
 def _installed(name: str) -> bool:
