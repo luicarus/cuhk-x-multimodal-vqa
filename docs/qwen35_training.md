@@ -25,7 +25,9 @@ vLLM is inference-only and cannot produce gradients, so it replaces the generati
 
 Both engines share the same data contract, prompt version, image protocol and closed answer space, so their scores are directly comparable. The signed run contract records `engine` and `engine_options`; the same `run-id` cannot mix results from two engines.
 
-The reference backend constrains decoding with a stateful `prefix_allowed_tokens_fn`. vLLM has no equivalent hook, so `Qwen35VLLMBackend` constrains the same language with `StructuredOutputsParams(choice=[...])`, pinning each legal answer to a literal prefix. Chat rendering is checked against the reference processor with `enable_thinking=False` before the engine is built, because the answer boundary depends on that exact encoding.
+The reference backend constrains decoding with a stateful `prefix_allowed_tokens_fn`. vLLM has no equivalent hook, so `Qwen35VLLMBackend` constrains the same language with `StructuredOutputsParams(choice=[...])`. `choice` takes the literal answer strings and vLLM builds the grammar itself, so the model can only emit one of them. Chat rendering is checked against the reference processor with `enable_thinking=False` before the engine is built, because the answer boundary depends on that exact encoding.
+
+`choice` must receive plain answers, never regexes. vLLM passes each element through `choice_as_grammar`, which escapes it into the grammar as a literal; handing it `r"\s*B"` produced a grammar matching the literal characters `\s*B`, so the model answered `\s*B` and every prediction was rejected as invalid. The prefix that motivated the regex is already implied by `choice`.
 
 ## Dual-T4 operation
 

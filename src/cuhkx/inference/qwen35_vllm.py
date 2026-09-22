@@ -83,19 +83,6 @@ def apply_engine_environment(environment=None) -> dict:
     return dict(target)
 
 
-def _choice_pattern(prefix: str) -> str:
-    """Restrict the answer grammar to the required literal prefix.
-
-    ``choice`` alone would let the model emit any legal answer. The dataset
-    presents its options in a fixed order and the reference backend can only
-    produce an output that is itself a legal answer, but a prefix is what makes
-    the two backends agree exactly, so it is enforced here too.
-    """
-    import re
-
-    return r"\s*" + re.escape(prefix)
-
-
 def render_prompt(tokenizer, prompt: str, *, enable_thinking: bool = False) -> str:
     """Render one user turn with the exact template arguments the lane pins."""
     messages = [{"role": "user", "content": prompt}]
@@ -245,12 +232,13 @@ class Qwen35VLLMBackend:
             top_p=1.0,
             max_tokens=max_new_tokens,
             skip_special_tokens=True,
-            # A bare ``choice`` list also accepts whitespace-padded or
-            # wrong-order variants depending on the backend; pinning the first
-            # character to a literal keeps vLLM's accepted language identical to
-            # the reference prefix automaton.
-            structured_outputs=self.StructuredOutputsParams(choice=[
-                _choice_pattern(value) for value in outputs]),
+            # ``choice`` takes literal answer strings. vLLM builds the grammar
+            # itself, so the model can only emit one of these exact strings --
+            # the same closed language the Transformers backend enforces with
+            # prefix_allowed_tokens_fn. Do not pass a regex here: a pattern like
+            # r"\s*B" would be escaped into the grammar and the model would
+            # answer with the literal characters "\s*B".
+            structured_outputs=self.StructuredOutputsParams(choice=list(outputs)),
         )
         results = self.engine.chat(
             messages,

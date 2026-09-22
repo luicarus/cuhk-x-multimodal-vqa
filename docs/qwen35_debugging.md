@@ -21,9 +21,10 @@
 | vLLM 与固定环境冲突 | vLLM 0.19.1 要求 `transformers>=4.56` 并固定 `torch==2.10.0` | 本 lane 用 `torch==2.10.0+cu128` / `torchvision==0.25.0+cu128` 匹配宿主 CUDA 12.8；7B lane 保持 2.7.1 + Transformers 4.57.6，不安装 vLLM |
 | `ImportError: libcudart.so.13` | vLLM 0.20+ 的预编译 wheel 链接 CUDA 13，宿主只有 libcudart.so.12 | 降到 0.19.1（最后一个链接 `libcudart.so.12` 的版本）；**必须读 wheel 里 `.so` 的 `DT_NEEDED`，不能只看 metadata** |
 | `libcuda.so.13: cannot open shared object file` | 同上，只是 `.so` 名称不同 | 同上 |
-| vLLM 对答案空间的约束与 Transformers 不一致 | vLLM 没有 `prefix_allowed_tokens_fn` 钩子 | 用 `StructuredOutputsParams(choice=[...])` 约束同一语言，并把每条答案固定为字面前缀；引擎启动前用参考 processor 校验 chat 渲染 |
+| vLLM 对答案空间的约束与 Transformers 不一致 | vLLM 没有 `prefix_allowed_tokens_fn` 钩子 | 用 `StructuredOutputsParams(choice=[...])` 约束同一语言；引擎启动前用参考 processor 校验 chat 渲染 |
 | 双 T4 上 vLLM 张量并行卡死或崩溃 | 两块 T4 无 NVLink，PCIe 上的 CUDA graph 捕获与 peer-to-peer 探测不稳定 | `enforce_eager=True`、`disable_custom_all_reduce=True`、`NCCL_P2P_DISABLE=1`，并用 `gpu_memory_utilization=0.80` 给 KV cache 留边界 |
-| 首次前向传播时 `/usr/bin/ld: cannot find -lcuda` | FlashInfer 为 SM 7.5 现场 JIT 编译，nvcc 链接 `-lcuda`；`libcuda.so` 属于 NVIDIA **驱动**，Kaggle 容器没有 `libcuda.so` 也没有 stubs 目录 | 换 attention 后端为 **`TRITON_ATTN`**。纯 Triton 实现，不需要 nvcc/链接；同时把启动时间从 ~10 分钟降下来 |
+| 首次前向传播时 `/usr/bin/ld: cannot find -lcuda` | FlashInfer 为 SM 7.5 现场 JIT 编译，nvcc 链接 `-lcuda`；`libcuda.so` 属于 NVIDIA **驱动**，Kaggle 容器没有 `libcuda.so` 也没有 stubs 目录 | 换 attention 后端为 **`TRITON_ATTN`**。纯 Triton 实现，不需要 nvcc/链接 |
+| 每条预测都 `invalid`，`raw_output` 是 `'\\s*B'` | 把**正则表达式**当候选答案喂给了 `choice`。vLLM 用 `choice_as_grammar` 把 `choice` 的每个元素**转义成字面量**，于是 grammar 变成只匹配字面串 `\s*B`，模型只能原样吐出它 | `choice` 只接受**纯文本答案**：`StructuredOutputsParams(choice=list(outputs))`。前缀约束本来就被 `choice` 蕴含，不需要额外正则 |
 
 **注意区分** `libcudart.so.N`（CUDA **运行时**，pip 装得到）和 `libcuda.so.N`（CUDA **驱动**，只有宿主有）。两者的报错措辞很像，但修法完全不同：
 

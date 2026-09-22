@@ -2,6 +2,7 @@ from pathlib import Path
 import re
 
 import pytest
+from PIL import Image
 
 from cuhkx.config import load_qwen35_config
 from cuhkx.training.dataset import load_training_config
@@ -149,6 +150,63 @@ def test_qwen35_vllm_backend_keeps_the_constrained_answer_space():
     assert "enforce_eager=True" in source
     assert "disable_custom_all_reduce=True" in source
     assert "NCCL_P2P_DISABLE" in source
+
+
+def test_qwen35_vllm_passes_literal_answers_to_choice():
+    """`choice` takes answer strings, not regexes.
+
+    vLLM builds the grammar from `choice` by escaping each element, so a regex
+    such as r"\\s*B" becomes a literal to match: the model then answers with the
+    characters "\\s*B" instead of "B", and every prediction is rejected as an
+    invalid answer. Assert on the value actually handed to SamplingParams.
+    """
+    from cuhkx.inference.qwen35_vllm import Qwen35VLLMBackend
+
+    captured = {}
+
+    class StructuredOutputsParams:
+        def __init__(self, **kwargs):
+            captured["structured_outputs"] = kwargs
+            self.kwargs = kwargs
+
+    class SamplingParams:
+        def __init__(self, **kwargs):
+            captured["sampling"] = kwargs
+
+    class Engine:
+        def chat(self, messages, **kwargs):
+            captured["messages"] = messages
+            captured["chat"] = kwargs
+            return [type("R", (), {"outputs": [type("O", (), {"text": "B"})()]})()]
+
+    backend = Qwen35VLLMBackend.__new__(Qwen35VLLMBackend)
+    backend.SamplingParams = SamplingParams
+    backend.StructuredOutputsParams = StructuredOutputsParams
+    backend.engine = Engine()
+    backend.adapter_request = None
+    backend.image_size = 280
+    backend.tensor_parallel_size = 2
+    backend.attention_backend = "TRITON_ATTN"
+
+    allowed = ("A", "B", "C", "D")
+    images = [Image.new("RGB", (280, 280)) for _ in range(4)]
+    try:
+        assert backend.generate(images, "prompt", allowed_outputs=allowed,
+                                max_new_tokens=8) == "B"
+    finally:
+        for image in images:
+            image.close()
+    assert captured["structured_outputs"]["choice"] == list(allowed)
+    # No regex or grammar may be smuggled in through the choice path.
+    for value in captured["structured_outputs"]["choice"]:
+        assert "\\" not in value and "*" not in value and "|" not in value
+
+
+def test_qwen35_vllm_never_builds_a_regex_answer_grammar():
+    source = (PROJECT / "src/cuhkx/inference/qwen35_vllm.py").read_text(encoding="utf-8")
+    assert "_choice_pattern" not in source
+    assert "re.escape" not in source
+    assert "regex=" not in source
 
 
 def test_qwen35_vllm_defaults_to_triton_attention():
