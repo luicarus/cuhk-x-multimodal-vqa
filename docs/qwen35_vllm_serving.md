@@ -34,11 +34,11 @@ DP2-B16 与 TP2-B32 有 675/682 条预测一致，7 条输出不同；两者的 
 - **启动占比与残差**：模型加载占端到端总耗时，TP2 逐条、TP2-B32、DP2-B16 分别约为 12.27%、14.66%、28.95%。端到端耗时减去加载和已记录推理阶段后，仍有约 7.86 / 7.76 / 7.60 s 未进一步拆分；这是残差，不能归因到单一组件。
 - **完成率**：4 个 run 均为 PASS，682/682 条记录有效，failed、invalid、pending、prompt leakage 均为 0，每条 checkpoint 只尝试 1 次；4 份提交文件的结构校验也通过。它说明运行和格式完整，不代表 test accuracy。
 - **TTFT 覆盖**：TP2 逐条 run 的 `ttft_ms` 为 `count=0, reported_by_engine=false`；两个 batch run 没有 TTFT 字段。因此现有日志不能给出 TTFT 分位数，也没有 batch P95。
-- **worker telemetry 缺口**：TP2-B32 的 worker telemetry 因 RPC 返回 function 对象而序列化失败，`workers` 为空；DP2-B16 的 RPC 返回两个 replica 的运行后 used/free 快照，但 allocator `peak_allocated` / `peak_reserved` 为 0。后者不是峰值显存，不能用来填 Peak HBM。
+- **worker telemetry 缺口**：TP2-B32 的 worker telemetry 因 RPC 返回 function 对象而序列化失败，`workers` 为空；DP2-B16 的 RPC 返回两个 replica 的运行结束 used/free 读数，但 allocator `peak_allocated` / `peak_reserved` 为 0。这些日志没有 Peak HBM，不能把运行结束读数标成峰值。
 
-## 显存快照
+## 显存观测
 
-下表是运行前后设备报告的空闲显存，单位 MiB。它用于观察本次运行前后系统余量变化，**不是 Peak HBM，也不是模型权重或 KV cache 的独立占用量**。
+下表列出设备在运行前和运行结束时报告的空闲显存，单位 MiB。它用于观察系统余量变化，**不是 Peak HBM，也不是模型权重或 KV cache 的独立占用量**。
 
 | Run | 运行前空闲 GPU0 / GPU1 | 运行后空闲 GPU0 / GPU1 |
 |---|---:|---:|
@@ -46,7 +46,7 @@ DP2-B16 与 TP2-B32 有 675/682 条预测一致，7 条输出不同；两者的 
 | TP2-B32 | 3710.8 / 3710.8 | 1316.8 / 1316.8 |
 | DP2-B16 | 4332.8 / 4332.8 | 3210.8 / 3104.8 |
 
-当前采集没有可靠的 worker-level Peak HBM、GPU 利用率或功耗。不同 Kaggle session 的初始显存也不完全相同，因此这里不把运行后快照解释成配置本身的峰值显存。
+当前采集没有可靠的 worker-level Peak HBM、GPU 利用率或功耗。不同 Kaggle session 的初始显存也不完全相同，因此不能把结束时的空闲量当作配置本身的峰值显存。
 
 ## 并发口径
 
@@ -65,7 +65,7 @@ V3 的运行合同记录 `data_parallel_size=2`、`tensor_parallel_size=1`、`ma
 
 - 当前 Git 版本包含 TP=2、`max_num_seqs=32` 的 vLLM 路径，可通过 `notebooks/qwen35-4b-vllm.ipynb` 运行。
 - V3 的 DP=2 / TP=1 / `max_num_seqs=16` 来自另一工作区的 Kaggle 实测；本地 `outputs/qwen35_4b_test/qwen35_4b_test_vllm_v3/resolved_config.json` 记录了运行配置，但对应实现尚未同步进当前仓库。因此 V3 是运行结果记录，不能声称当前 checkout 可直接复现。
-- 显存数值是运行前后的设备快照，不是峰值；不同 Kaggle session 的后台占用可能不同。本次没有采集 GPU 利用率、功耗或实际账单成本。
+- 显存字段记录运行前与运行结束时的 used/free 容量，不是峰值；不同 Kaggle session 的后台占用可能不同。本次没有采集 GPU 利用率、功耗或实际账单成本。
 - vLLM 批处理 run 的准确 batch 级明细由本地 `outputs/` 中的 `run_summary.json` 保存。`outputs/` 被 Git 忽略，不包含在公开仓库中。
 
 汇总本地已保存的 run：
