@@ -1,67 +1,71 @@
-# CUHK-X Large Model Track：隐私保护视频多模态问答
+# Qwen3.5-4B Inference Infrastructure for Multimodal VQA
 
-面向 [CUHK-X Competition Large Model Track](https://www.kaggle.com/competitions/cuhk-x-competition-large-model-track) 的端到端可复现方案。项目使用红外视频的固定抽帧缓存，完成视觉语言模型推理、受约束答案生成、模型对照和 QLoRA 后训练。
+面向 **AI Infra / Inference Engineering** 的工程项目。以隐私保护视频问答为工作负载，在 Kaggle 双 T4 上构建并测量 Qwen3.5-4B 推理链路，重点处理 vLLM 请求批处理、TP/DP 配置对比、运行时指标采集、输出约束和可恢复交付。
 
-> An end-to-end, reproducible multimodal VQA pipeline for privacy-preserving human activity understanding, covering deterministic frame selection, constrained decoding, model comparison, and QLoRA post-training.
+> Built a measurable and recoverable multimodal inference workflow: vLLM serving, request batching, parallelism experiments, process-aware GPU telemetry, constrained outputs, and integrity-checked releases.
 
-## 项目结果
+项目关注“服务如何运行、性能如何测量、结果如何复现”。竞赛任务为应用场景；模型准确率与推理系统指标分开报告。
 
-| 方案 | Kaggle 最终分数 | 相对对应 baseline 的变化 |
-|---|---:|---:|
-| Qwen2.5-VL-7B baseline | 0.41764 | — |
-| Qwen2.5-VL-7B QLoRA | 0.42058 | +0.00294 |
-| Qwen3.5-4B baseline | 0.44411 | — |
-| **Qwen3.5-4B QLoRA** | **0.54705** | **+0.10294** |
+## 工程摘要
 
-最佳方案相对最初的 Qwen2.5-VL-7B baseline 提升 **0.12941**。Qwen3.5-4B QLoRA 在固定开发集上也由 `0.44667` 提升至 `0.54133`。
+| 方向 | 项目内容 |
+|---|---|
+| Serving | Qwen3.5-4B、vLLM 0.19.1、双 T4；当前代码路径为 TP=2，另有 DP=2 实测对照 |
+| Scheduling | [`runner.py`](src/cuhkx/inference/runner.py) 按 `max_num_seqs` 分批；[`qwen35_vllm.py`](src/cuhkx/inference/qwen35_vllm.py) 为每条请求应用独立答案约束 |
+| Observability | [`profiling.py`](src/cuhkx/inference/profiling.py) 与 [`bench_report.py`](scripts/bench_report.py) 汇总加载、延迟、吞吐、token rate 和显存 |
+| Reliability | 固定模型 revision、输入签名、运行合同与 checkpoint；校验提交格式及完整性 |
+| Delivery | 哈希锁定依赖，使用清单摘要和有界解包验证云端包来源与内容 |
 
-以上 Kaggle 分数来自最终提交记录（2026-09-17），未声明竞赛排名。开发集分数与 Kaggle 分数采用不同数据划分，不直接混用。
+## 工作负载与请求链路
 
-## 竞赛任务
-
-竞赛要求模型回答隐私保护短视频中的多项选择题，涵盖动作识别、动作组合、时序关系、情绪和物体交互。测试集来自训练阶段未出现的受试者，因此核心难点包括：
-
-- 从非 RGB 视频中提取稳定的时序视觉信息；
-- 泛化到未见过的受试者；
-- 同时支持单选、多选集合和有序答案；
-- 在云端 GPU 环境中稳定复现推理和后训练结果。
-
-## 方法概览
+CUHK-X Large Model Track 的输入是隐私保护红外视频多项选择题。原始视频处理已完成；本项目复用 IR8 缓存，每题选择零起始索引 `[1, 3, 5, 7]`（第 2/4/6/8 帧），缩放为 4 × 280×280 输入。test 工作负载包含 682 条请求，覆盖 single、multi、combination、sequence、object interaction 和 emotion 六类题型。
 
 ```mermaid
 flowchart LR
-    A[已有 EDA 与 IR8 缓存] --> B[固定选择第 2/4/6/8 帧]
-    B --> C[4 × 280×280 图像输入]
-    C --> D{视觉语言模型}
-    D --> E[Qwen2.5-VL-7B]
-    D --> F[Qwen3.5-4B]
-    E --> G[Baseline / QLoRA]
-    F --> G
-    G --> H[按题型约束解码]
-    H --> I[答案规范化与提交校验]
+    A[IR8 缓存与 QA] --> B[输入校验与签名]
+    B --> C[Runner 分批提交]
+    C --> D[vLLM / Qwen3.5-4B]
+    D --> E[按请求约束答案空间]
+    E --> F[Checkpoint 与 Audit]
+    F --> G[Submission 校验]
+    C -. profiling .-> H[延迟 / 吞吐 / 显存]
+    D -. worker telemetry .-> H
 ```
 
-项目保留每个视频均匀抽取的 8 帧、448×448 IR JPEG 缓存，模型实际读取零起始索引 `[1, 3, 5, 7]`，即第 2、4、6、8 帧。原始视频体积较大，因此重构后的流程不重新执行 EDA 或抽帧。
+QLoRA 后训练仍保留在项目中，训练、dev 选择与 confirm/test 门禁使用固定的 subject-grouped 五折数据：train 2,593 QA、dev 750 QA、confirm 624 QA；这部分作为推理工作负载的上游模型生命周期，不作为本 README 的主要叙事。
 
-训练数据采用固定的 subject-grouped 五折划分：
+## AI Infra 工程实现
 
-| 用途 | 数据 | QA 数量 |
-|---|---|---:|
-| QLoRA 训练 | fold 0–2 | 2,593 |
-| 开发集选择 | fold 3 | 750 |
-| 固定确认 | fold 4 去除 pilot | 624 |
-| 历史诊断 | pilot | 120 |
+- **批处理与并行策略**：当前仓库实现 vLLM TP=2 推理，并以 `max_num_seqs` 调整请求批次；请求结束后输出实际批次大小和吞吐。V3 还测量了 DP=2、TP=1、`max_num_seqs=16`，具体结果见下表。
+- **请求级结构化输出**：为 batch 中每条请求分别构造 `SamplingParams`，使单选和有序多选使用各自答案空间；避免共享约束造成越界答案或错误 grammar。
+- **进程感知的指标采集**：分别记录模型加载、image/generation/overhead 阶段、请求延迟分位、TTFT、token rate、batch 吞吐和逐卡显存。vLLM worker 在子进程运行，worker 指标通过引擎 RPC 采样，避免把父进程的零显存读数误当作真实用量。
+- **可恢复运行**：记录 engine、模型 revision、输入签名、配置合同和 checkpoint；`--resume` 只接受签名一致的运行，避免不同引擎或数据源混用同一 run-id。
+- **输出与发布校验**：验证每个 test ID 恰好对应一条规范答案；云端 ZIP 用文件清单、哈希、包大小和路径检查，依赖安装使用哈希锁。
+- **模型生命周期门禁**：保留 QLoRA 训练与 dev/confirm/test 流程，检查 adapter 来源、目标层、权重更新和模型 revision。
 
-## 工程实现
+## vLLM 性能实测
 
-- **确定性输入协议**：固定选帧、图像尺寸、prompt 版本和答案解析规则，保证模型对比只改变目标变量。
-- **多模型隔离**：Qwen2.5-VL-7B 与 Qwen3.5-4B 使用独立配置、依赖锁、Notebook、权重校验和运行目录。
-- **vLLM 双卡加速**：Qwen3.5-4B 的 adapter 重载、dev/confirm 评估与 test 推理在 2×T4 上以 vLLM 0.19.1 张量并行运行；训练仍走 Transformers，因为 vLLM 不支持训练。运行合同记录 `engine`，两种引擎的结果不会混用同一 run-id。
-- **可恢复执行**：推理和训练保存 contract、checkpoint、数据签名与环境信息，支持安全 `--resume`。
-- **严格 adapter 验证**：检查 LoRA target、基础模型 revision、权重有限性、非零更新和来源收据。
-- **防数据泄漏门禁**：先在 dev 选择候选，再运行 confirm；只有 confirm 提升后才生成 test submission。
-- **可移植云端包**：训练 ZIP 内置完整五折 IR8 缓存，不依赖原始视频；打包时验证文件清单、哈希和图片解码。
-- **无 GPU 本地检查**：本地只执行 CPU 数据与契约测试，不产生 `reports/`、`docs/` 或 `outputs/` 临时结果。
+以下 run 使用相同的 Qwen3.5-4B revision、682 条 test 请求和双 T4。TP 批处理与 DP 实验使用相同的输入签名和 vLLM 软件版本；Transformers 行作为跨引擎参考。表中“推理阶段吞吐”排除模型加载；“端到端耗时”包含模型加载。批处理 run 的单请求耗时是整批时间摊到每条请求，不代表单请求 P95。
+
+| Run | Serving 配置 | 加载时间 | 推理阶段吞吐 | 推理阶段耗时 | 端到端耗时 | 结束时每卡剩余显存 |
+|---|---|---:|---:|---:|---:|---:|
+| Transformers baseline | `device_map`，batch 1 | 7.6 s | 未记录 | 未记录 | 768.6 s（0.887 req/s） | 未记录 |
+| vLLM TP 单请求 | TP=2 | 82.8 s | 1.167 req/s | 均值 856.8 ms；P95 1010.2 ms | 675.0 s（1.010 req/s） | 3.66 GiB / 卡 |
+| vLLM TP 批处理 | TP=2，`max_num_seqs=32` | 83.2 s | 1.430 req/s | 摊销 699.2 ms / 请求 | **567.8 s（1.201 req/s）** | 1.29 GiB / 卡 |
+| vLLM DP 实验 | DP=2、TP=1，`max_num_seqs=16` | 182.5 s | **1.549 req/s** | **摊销 645.6 ms / 请求** | 630.4 s（1.082 req/s） | 3.14 / 3.03 GiB |
+
+TP 批处理与 DP 实验的推理阶段数据分别来自 22 个、43 个 batch；平均实际 batch 大小为 31.0 和 15.86。DP 实验相较 TP 批处理吞吐提高 **8.3%**，摊销耗时降低 **7.7%**，推理阶段节省约 **36.5 秒**；但模型加载多约 **99.3 秒**，因此这次单次 682 请求的端到端时间反而多 **62.6 秒**。按双卡全程占用估算，启动加推理约为 TP 批处理 **1665**、DP 实验 **1849 GPU 卡秒 / 千请求**。DP 结束时每卡多保留约 **1.75–1.85 GiB** 显存。
+
+**复现范围说明：** DP=2 / `max_num_seqs=16` 的 V3 是另一工作区生成的 Kaggle 实测；本地 `outputs/qwen35_4b_test/qwen35_4b_test_vllm_v3/resolved_config.json` 记录了实际配置，但对应实现尚未同步进当前 Git commit。当前 checkout 可复现 TP=2 / `max_num_seqs=32` 路径。DP 指标是已测量的实验结果，暂不能声称可由当前 checkout 直接复现。
+
+TP 批处理与 DP 实验有 **675/682（98.97%）** 预测一致，7 条不同；两者的提交文件都通过 682 行格式校验。test 标签不在本地，因此不能从这些输出判断哪种配置准确率更高。批处理 run 未记录可比的 P95；GPU 利用率和功耗也未采集。显存列是运行后的设备快照，不是峰值。
+
+汇总本机已保存的 run（只读 `outputs/`，不启动模型、不写报告文件）：
+
+```powershell
+python scripts/bench_report.py
+python scripts/bench_report.py --baseline qwen35_4b_test
+```
 
 ## 可复现入口
 
@@ -120,9 +124,22 @@ tests/                    不污染工作区的 CPU 回归测试
 
 - 仓库复用已完成的 EDA 和抽帧结果，不包含重新处理原始视频的主流程。
 - 本地环境无 GPU；GPU 推理和训练结果来自 Kaggle 云端运行。
-- vLLM 路径本地只做 CPU 契约与语法校验，双卡张量并行的真实吞吐与显存需在 2×T4 session 中实测。
+- 批处理 run 没有可比较的 P95，也没有 GPU 利用率、功耗或成本采样；显存数据是运行前后设备快照。
 - 模型权重、竞赛原始数据和生成的 ZIP 不纳入 Git，使用时需遵守各自许可证与竞赛规则。
-- Kaggle 最终排名由竞赛方的私榜和后续评审决定，本仓库只记录可核对的提交分数。
+- test 标签不在本地；本地校验能证明提交完整、格式正确，不能替代 Kaggle accuracy 或 leaderboard 分数。
+
+## 竞赛效果背景
+
+推理基础设施运行的是多模态问答工作负载。最终 Kaggle 提交结果如下；这些分数说明任务效果，不是 serving 吞吐指标。
+
+| 模型与方案 | Kaggle 分数 |
+|---|---:|
+| Qwen2.5-VL-7B baseline | 0.41764 |
+| Qwen2.5-VL-7B QLoRA | 0.42058 |
+| Qwen3.5-4B baseline | 0.44411 |
+| Qwen3.5-4B QLoRA | **0.54705** |
+
+分数来自 2026-09-17 的最终提交记录；不据此声明竞赛排名。
 
 ## Competition
 
