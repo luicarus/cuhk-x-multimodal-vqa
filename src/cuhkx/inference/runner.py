@@ -192,6 +192,22 @@ def _verify_finished(output, summary, records, target_ids, signature):
     require((summary["status"] == "PASS") == complete, "summary falsely claims completion")
 
 
+def _release_backend(backend):
+    """Release engine-held resources once a run is finished.
+
+    Only backends that own something outside this process define close(); the
+    single-engine paths need nothing. Cleanup never fails a run: the results are
+    already written and verified by the time this is called.
+    """
+    close = getattr(backend, "close", None)
+    if close is None:
+        return
+    try:
+        close()
+    except Exception:                     # noqa: BLE001 - cleanup only
+        pass
+
+
 def run_predictions(config, dataset, limit, run_id, model_source, backend_factory, *, resume=False,
                     execution_mode="cloud", fail_fast=True, prepared_input=None,
                     engine="transformers", engine_options=None):
@@ -384,4 +400,10 @@ def run_predictions(config, dataset, limit, run_id, model_source, backend_factor
                    "output_sha256": {name: sha256(output / name) for name in ARTIFACTS}}
         write_json(summary_path, summary)
         _verify_finished(output, summary, records, target_ids, signature)
+        # Release the engine after every figure has been sampled and written. In
+        # data-parallel mode each replica is a separate process holding most of a
+        # GPU, and they are not daemons (vLLM spawns workers beneath them), so
+        # without this a smoke run would keep both cards reserved for the rest of
+        # the session.
+        _release_backend(backend)
         return summary

@@ -23,7 +23,12 @@ ARCHIVE_NAME = "qwen35_4b.zip"
 # Declared in the manifest so the notebook can refuse a package built for
 # another engine. This lane is inference-only: the QLoRA package carries the
 # training stack, this one carries the vLLM generation engine.
-INFERENCE_ENGINE = "vllm_0.19.1_tensor_parallel"
+INFERENCE_ENGINE = "vllm_0.19.1_dual_gpu"
+# The notebooks own the topology; the manifest only has to name the engine family
+# so a package built for another one is refused. Declaring a fixed
+# tensor_parallel_size here would go stale the moment the notebook switches
+# between tensor and data parallelism, which is exactly what happened.
+DUAL_GPU = True
 CODE_FILES = (
     "pyproject.toml", "src/cuhkx/__init__.py", "src/cuhkx/config.py", "src/cuhkx/cli.py",
     "src/cuhkx/release_security.py",
@@ -102,7 +107,7 @@ def collect(project: Path) -> dict[str, bytes]:
         "training_included": False,
         # Declared so the notebook can refuse a package built for another engine.
         "inference_engine": INFERENCE_ENGINE,
-        "tensor_parallel_size": 2,
+        "dual_gpu": DUAL_GPU,
         "baseline_reference": "Qwen2.5-VL-7B IR4 baseline remains outside this package",
         "files": [{"path": name, "bytes": len(content),
                    "sha256": hashlib.sha256(content).hexdigest()}

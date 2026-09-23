@@ -50,6 +50,10 @@ def add_inference_backend(command):
                               "and to Transformers for the Qwen2.5-VL-7B lane.")
     command.add_argument("--tensor-parallel-size", type=int, default=2,
                          help="vLLM tensor parallelism across visible GPUs (Kaggle 2x T4 default)")
+    command.add_argument("--data-parallel-size", type=int, default=1,
+                         help="Independent vLLM replica per GPU. Mutually exclusive with "
+                              "tensor parallelism above 1; on PCIe-only T4s it removes the "
+                              "cross-card all-reduce entirely.")
     command.add_argument("--gpu-memory-utilization", type=float, default=0.80,
                          help="Fraction of each GPU vLLM may reserve")
     command.add_argument("--attention-backend", default=None,
@@ -75,6 +79,12 @@ def resolve_backend(args, profile):
                 "vLLM is only wired for the Qwen3.5 lane; the 7B lane uses NF4 on Transformers")
         require(getattr(args, "adapter_dir", None) is None or profile == "qwen35",
                 "unsupported adapter/backend combination")
+        tensor_parallel = int(getattr(args, "tensor_parallel_size", 1) or 1)
+        data_parallel = int(getattr(args, "data_parallel_size", 1) or 1)
+        require(not (tensor_parallel > 1 and data_parallel > 1),
+                "the two GPUs are either split inside one replica "
+                "(--tensor-parallel-size 2) or divided between replicas "
+                "(--data-parallel-size 2 --tensor-parallel-size 1), not both")
     return chosen
 
 
@@ -87,11 +97,18 @@ def engine_options(args, profile):
     """Engine settings that must appear in the signed run contract."""
     if resolve_backend(args, profile) != "vllm":
         return {}
-    return {"tensor_parallel_size": args.tensor_parallel_size,
-            "gpu_memory_utilization": args.gpu_memory_utilization,
-            "attention_backend": getattr(args, "attention_backend", None)
-            or default_attention_backend(),
-            "max_num_seqs": args.max_num_seqs}
+    options = {"tensor_parallel_size": args.tensor_parallel_size,
+               "gpu_memory_utilization": args.gpu_memory_utilization,
+               "attention_backend": getattr(args, "attention_backend", None)
+               or default_attention_backend(),
+               "max_num_seqs": args.max_num_seqs}
+    data_parallel = int(getattr(args, "data_parallel_size", 1) or 1)
+    if data_parallel > 1:
+        # Recorded because it changes the topology: two replicas each holding a
+        # full model is a different run from one model split over two cards, and
+        # the same run-id must never mix them.
+        options["data_parallel_size"] = data_parallel
+    return options
 
 
 def build_backend(profile, config, args, run_output):
@@ -104,6 +121,7 @@ def build_backend(profile, config, args, run_output):
         return Qwen35VLLMBackend(
             config["baseline"], weights, adapter=adapter,
             tensor_parallel_size=args.tensor_parallel_size,
+            data_parallel_size=int(getattr(args, "data_parallel_size", 1) or 1),
             gpu_memory_utilization=args.gpu_memory_utilization,
             attention_backend=getattr(args, "attention_backend", None)
             or default_attention_backend(),
@@ -209,6 +227,7 @@ def main(argv: list[str] | None = None) -> int:
                                            adapter=args.adapter_dir,resume=args.resume,
                                            backend=resolve_backend(args, profile),
                                            tensor_parallel_size=args.tensor_parallel_size,
+                                           data_parallel_size=int(getattr(args, "data_parallel_size", 1) or 1),
                                            gpu_memory_utilization=args.gpu_memory_utilization,
                                            attention_backend=args.attention_backend
                                            or default_attention_backend(),

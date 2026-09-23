@@ -28,7 +28,11 @@ def test_qwen35_package_allowlist_and_extraction(tmp_path):
         assert manifest["model_revision"] is None
         assert manifest["training_included"] is False
         assert manifest["inference_engine"] == PACKAGE.INFERENCE_ENGINE
-        assert manifest["tensor_parallel_size"] == 2
+        # The topology itself is chosen by the notebook, so the manifest only
+        # asserts that both GPUs are expected. Pinning a specific
+        # tensor_parallel_size here went stale as soon as the lane moved to data
+        # parallelism, and the notebook would then have refused a valid package.
+        assert manifest["dual_gpu"] is True
         names = set(zipped.namelist())
         assert "qwen35_repo/notebooks/qwen35-4b-vllm.ipynb" in names
         assert "qwen35_repo/notebooks/cuhk-x-base7b.ipynb" not in names

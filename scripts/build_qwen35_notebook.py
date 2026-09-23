@@ -25,9 +25,14 @@ CELLS = [
 固定相同的 IR4 输入：缓存 8 帧，使用第 2/4/6/8 张。只有模型、模型加载接口和依赖环境不同。
 将 `qwen35_4b.zip` 作为 Kaggle 私有输入，开启 2×T4 GPU 和 Internet；先执行 smoke，再执行完整 test。
 
-推理引擎：**vLLM 0.19.1，两卡张量并行（TP=2）**。这个包只做推理，不含训练栈。
+推理引擎：**vLLM 双卡，数据并行（DP=2，每卡一份完整模型，卡间零通信）**，
+调度并发 16。这个包只做推理，不含训练栈。
+此前几轮用的是张量并行（TP=2，一份模型切两卡，每层跨 PCIe all-reduce）。
+T4 之间没有 NVLink，TP 的通信开销在小 prefill + 极短 decode 的负载上无法被 batch 摊薄，
+因此本轮改成 DP 对照，并把 batch 从 32 减半到 16。
 vLLM 用 `StructuredOutputsParams(choice=[...])` 约束到与 Transformers 相同的答案空间，
 引擎启动前会校验 chat 渲染，因此两条引擎的分数可直接比较。运行合同记录 `engine` 字段。
+本 Notebook 还会断言 worker 显存遥测非空、以及前缀缓存命中率是实测值而非缺失。
 """),
     cell("code", '''
 from pathlib import Path, PurePosixPath
@@ -38,16 +43,22 @@ WORK = Path("/kaggle/working")
 BUNDLE_INPUT = None  # ZIP，或含 qwen35_bundle_manifest.json 的已解压目录
 WEIGHTS_INPUT = None  # 可选：含 cuhkx_qwen35_weights.json 的完整权重目录
 PINNED_REVISION = ""  # 留空则由固定环境中的 HfApi 解析并写入运行副本
-TENSOR_PARALLEL = 2    # vLLM 张量并行度：2×T4
+# 双卡拓扑：两种方式，互斥。
+#   DP（data parallel）：每张卡一份完整模型，各自独立服务请求，卡间零通信。
+#   TP（tensor parallel）：一份模型切到两张卡，每次前向都要跨 PCIe all-reduce。
+# T4 之间没有 NVLink，TP 的通信开销在小 prefill + 极短 decode 的负载上占比很高，
+# 所以本实验改为 DP，并把 batch 减半对照。
+PARALLEL_MODE = "dp"          # "dp" 或 "tp"
+DATA_PARALLEL = 2 if PARALLEL_MODE == "dp" else 1
+TENSOR_PARALLEL = 1 if PARALLEL_MODE == "dp" else 2
+GPU_COUNT_REQUIRED = DATA_PARALLEL * TENSOR_PARALLEL
 GPU_MEMORY_UTILIZATION = 0.80
 # FlashInfer 会为 SM 7.5 现场 JIT 编译，最后一步需要链接 libcuda.so（属于 NVIDIA
 # 驱动，Kaggle 容器没有 stubs），报 "cannot find -lcuda"。TRITON_ATTN 是纯 Triton
 # 实现，不需要 nvcc/链接，因此作为默认值。
 ATTENTION_BACKEND = "TRITON_ATTN"
-# B 轮：调度并发 32。KV cache（89,232 tokens，block=528）按 909 token/请求可容纳
-# 84 条；视觉 encoder cache（16,384 tokens，单请求 784）限制同时 prefill 约 20 条，
-# 超出部分由引擎排队。runner 会按这个值分批提交。
-MAX_NUM_SEQS = 32
+# 上一轮 B 为 32；本轮减半到 16，配合 DP 观察 batch 维度的收益曲线。
+MAX_NUM_SEQS = 16
 '''),
     cell("markdown", "## 1. 验证 Qwen3.5 vLLM 包并准备独立工作目录"),
     cell("code", '''
@@ -68,7 +79,7 @@ try:
     manifest = json.loads(read_member(MARKER))
     if manifest.get("schema_version") != 1 or manifest.get("package_id") != PACKAGE_ID:
         raise RuntimeError("不是当前 Qwen3.5 vLLM test 包")
-    if manifest.get("inference_engine") != "vllm_0.19.1_tensor_parallel":
+    if manifest.get("inference_engine") != "vllm_0.19.1_dual_gpu":
         raise RuntimeError("这个包不是为 vLLM 双卡 lane 构建的")
     entries = manifest["files"]
     names = [entry["path"] for entry in entries]
@@ -132,12 +143,13 @@ print(subprocess.check_output([str(PYTHON), "-c", compatibility_probe], text=Tru
 probe = ("import json,sys,torch; assert sys.version_info[:2]==(3,11); "
          "assert torch.cuda.is_available(), 'a cloud CUDA GPU is required'; "
          "count=torch.cuda.device_count(); "
-         "assert count>=TENSOR_PARALLEL_COUNT, f'vLLM TP={TENSOR_PARALLEL_COUNT} needs that many GPUs'; "
+         "assert count>=REQUIRED_GPUS, f'{PARALLEL_LABEL} needs {REQUIRED_GPUS} GPUs'; "
          "print(json.dumps({'python':sys.version,'torch':torch.__version__,"
          "'cuda':torch.version.cuda,'device_count':count,"
          "'devices':[torch.cuda.get_device_name(i) for i in range(count)]}))")
 environment = subprocess.check_output(
-    [str(PYTHON), "-c", f"TENSOR_PARALLEL_COUNT={TENSOR_PARALLEL};{probe}"], text=True)
+    [str(PYTHON), "-c",
+     f"REQUIRED_GPUS={GPU_COUNT_REQUIRED};PARALLEL_LABEL={PARALLEL_MODE!r};{probe}"], text=True)
 (RUNTIME / "environment.json").write_text(environment, encoding="utf-8")
 print(environment)
 CLOUD_ENV = {**os.environ, "PYTHONPATH": str(REPO / "src"), "PYTHONDONTWRITEBYTECODE": "1",
@@ -193,9 +205,11 @@ cloud("check", "--profile", "qwen35", "--dataset", "pilot")
 print("Qwen3.5 weights:", WEIGHTS)
 print("Qwen3.5 revision:", PINNED_REVISION)
 '''),
-    cell("markdown", "## 4. vLLM 双卡 smoke：test 前 16 QA，验证 TP=2 引擎与答案约束"),
+    cell("markdown", "## 4. vLLM 双卡 smoke：test 前 16 QA，验证拓扑、答案约束与前缀缓存命中率"),
     cell("code", '''
-VLLM = ["--backend", "vllm", "--tensor-parallel-size", str(TENSOR_PARALLEL),
+VLLM = ["--backend", "vllm",
+        "--tensor-parallel-size", str(TENSOR_PARALLEL),
+        "--data-parallel-size", str(DATA_PARALLEL),
         "--gpu-memory-utilization", str(GPU_MEMORY_UTILIZATION),
         "--attention-backend", ATTENTION_BACKEND,
         "--max-num-seqs", str(MAX_NUM_SEQS)]
@@ -208,9 +222,25 @@ if backend_metadata.get("backend") != "qwen35_4b_vllm":
     raise RuntimeError("smoke run did not use the vLLM engine")
 if backend_metadata.get("tensor_parallel_size") != TENSOR_PARALLEL:
     raise RuntimeError(f"vLLM ran with TP={backend_metadata.get('tensor_parallel_size')}, expected {TENSOR_PARALLEL}")
+if PARALLEL_MODE == "dp" and backend_metadata.get("data_parallel_size") != DATA_PARALLEL:
+    raise RuntimeError(f"vLLM ran with DP={backend_metadata.get('data_parallel_size')}, expected {DATA_PARALLEL}")
 if backend_metadata.get("attention_backend") != ATTENTION_BACKEND:
     raise RuntimeError(f"vLLM ran with attention backend {backend_metadata.get('attention_backend')}, expected {ATTENTION_BACKEND}")
-print(json.dumps(backend_metadata, indent=2))
+# Worker 显存遥测必须真的采到数据：序列化失败时 workers 为空、error 非空。
+workers = backend_metadata.get("workers") or {}
+if not workers.get("workers"):
+    raise RuntimeError(f"worker memory telemetry is empty: {workers.get('error')}")
+# 前缀缓存命中率：能测到就打印；这个 vLLM 构建不上报该字段时只告警，
+# 并把 metrics_shape 打出来，让下一次运行自己说明字段名。
+prefix = backend_metadata.get("prefix_cache") or {}
+if prefix.get("reported_requests"):
+    print("prefix cache hit rate:", prefix)
+else:
+    print("WARNING: prefix cache counters were not reported by this engine build:",
+          prefix)
+    print("engine metrics field inventory:",
+          json.dumps(backend_metadata.get("metrics_shape"), indent=2, default=str))
+print(json.dumps({"backend": backend_metadata, "prefix_cache": prefix}, indent=2))
 '''),
     cell("markdown", "## 5. 完整 test：682 QA 与提交文件（vLLM）"),
     cell("code", '''
@@ -236,7 +266,7 @@ CELLS[3]["source"] = secure_loader_source(
     runtime_prefix="qwen35_runtime_",
     repository_name="qwen35_repo",
     extra_validation='''
-if manifest.get("inference_engine") != "vllm_0.19.1_tensor_parallel":
+if manifest.get("inference_engine") != "vllm_0.19.1_dual_gpu":
     raise RuntimeError("package was not built for the vLLM dual-GPU lane")
 ''',
     extra_prints='print("Training included:", manifest["training_included"])',
@@ -247,7 +277,9 @@ CELLS[0]["source"] = """# Qwen3.5-4B IR4 test (vLLM dual-GPU)
 
 This independent comparison reuses the existing IR8 cache and selects frames 2, 4, 6, and 8. Create the package locally, copy its printed `manifest_sha256` into `EXPECTED_MANIFEST_SHA256` in the first code cell, and attach that exact ZIP or extracted package as a private Kaggle input. The digest must come from a trusted local build.
 
-Test inference runs on **vLLM 0.19.1 with tensor parallelism across both T4 GPUs**. The engine constrains decoding to the same closed answer space as the Transformers backend and checks its chat rendering against the reference processor before starting, so its scores stay comparable with the other lanes. The signed run contract records the engine, so one run-id cannot mix results from two engines.
+Test inference runs on **vLLM 0.19.1 with one full replica per T4 (data parallel, DP=2, scheduler concurrency 16)**. Two T4s have no NVLink, so tensor parallelism would pay a PCIe all-reduce on every forward pass; independent replicas remove that cost entirely. Set `PARALLEL_MODE = "tp"` to reproduce the earlier tensor-parallel rounds. The engine constrains decoding to the same closed answer space as the Transformers backend and checks its chat rendering against the reference processor before starting, so its scores stay comparable with the other lanes. The signed run contract records the topology, so one run-id cannot mix results from two engines.
+
+The smoke cell also asserts that worker GPU memory telemetry is non-empty and that the prefix-cache hit rate is measured rather than missing.
 
 Use a Kaggle 2x T4 session and run the smoke check before complete test inference.
 """

@@ -21,7 +21,7 @@ MANIFEST = "qwen35_training_bundle_manifest.json"
 PREFIX = "qwen35_training_repo/"
 NOTEBOOK = "notebooks/qwen35-4b-qlora-vllm.ipynb"
 ARCHIVE_NAME = "qwen35_4b_qlora.zip"
-INFERENCE_ENGINE = "vllm_0.19.1_tensor_parallel"
+INFERENCE_ENGINE = "vllm_0.19.1_dual_gpu"
 DATA_FILES = {
     "data/qa/test.csv", "data/qa/pilot.csv", "data/qa/sample_submission.csv",
     "data/references/pilot_answers.csv", "data/references/training_qa.csv",
@@ -109,7 +109,7 @@ def collect(project: Path):
         "training_cache_mode": "embedded_complete",
         # Declared so the notebook can refuse a package built for another engine.
         "inference_engine": INFERENCE_ENGINE,
-        "tensor_parallel_size": 2,
+        "dual_gpu": True,
         "files": [{"path": name, "bytes": len(content),
                    "sha256": hashlib.sha256(content).hexdigest()}
                   for name, content in sorted(payloads.items())],

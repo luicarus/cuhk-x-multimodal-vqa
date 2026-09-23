@@ -43,17 +43,18 @@ WORK = Path("/kaggle/working")
 BUNDLE_INPUT = None  # ZIP，或含 qwen35_training_bundle_manifest.json 的目录
 WEIGHTS_INPUT = None  # 可选：含 cuhkx_qwen35_weights.json 的完整 Qwen3.5 权重目录
 EXPERIMENT = "qwen35_vllm_full_v1"
-TRAIN_GPU = 0          # 训练固定单卡，避免与 vLLM 的 TP 进程争抢显存
-TENSOR_PARALLEL = 2    # vLLM 张量并行度：2×T4
+TRAIN_GPU = 0          # 训练固定单卡，避免与 vLLM 进程争抢显存
+# 双卡拓扑：DP（每卡一份完整模型，卡间零通信）或 TP（一份模型切两卡，跨 PCIe
+# all-reduce）。T4 无 NVLink，本实验改用 DP，batch 从 32 减半到 16。
+PARALLEL_MODE = "dp"
+DATA_PARALLEL = 2 if PARALLEL_MODE == "dp" else 1
+TENSOR_PARALLEL = 1 if PARALLEL_MODE == "dp" else 2
 GPU_MEMORY_UTILIZATION = 0.80
 # FlashInfer 会为 SM 7.5 现场 JIT 编译，最后一步需要链接 libcuda.so（属于 NVIDIA
 # 驱动，Kaggle 容器没有 stubs），报 "cannot find -lcuda"。TRITON_ATTN 是纯 Triton
 # 实现，不需要 nvcc/链接，因此作为默认值。
 ATTENTION_BACKEND = "TRITON_ATTN"
-# B 轮：调度并发 32。KV cache（89,232 tokens，block=528）按 909 token/请求可容纳
-# 84 条；视觉 encoder cache（16,384 tokens，单请求 784）限制同时 prefill 约 20 条，
-# 超出部分由引擎排队。runner 会按这个值分批提交。
-MAX_NUM_SEQS = 32
+MAX_NUM_SEQS = 16
 RUN_CONFIRMATION = False
 RUN_TEST = False
 PACKAGE_ID = "cuhkx-qwen35-4b-qlora-vllm-v1"
@@ -240,7 +241,9 @@ ADAPTER = REPO / "artifacts/training/qwen35_pt_sft/adapter"
 '''),
     cell("markdown", "## 6. vLLM 双卡短跑：验证 TP=2 引擎、答案约束与 adapter 重载"),
     cell("code", r'''
-VLLM = ["--backend", "vllm", "--tensor-parallel-size", str(TENSOR_PARALLEL),
+VLLM = ["--backend", "vllm",
+        "--tensor-parallel-size", str(TENSOR_PARALLEL),
+        "--data-parallel-size", str(DATA_PARALLEL),
         "--gpu-memory-utilization", str(GPU_MEMORY_UTILIZATION),
         "--attention-backend", ATTENTION_BACKEND,
         "--max-num-seqs", str(MAX_NUM_SEQS)]
@@ -254,13 +257,28 @@ if backend_metadata.get("backend") != "qwen35_4b_vllm":
     raise RuntimeError("smoke run did not use the vLLM engine")
 if backend_metadata.get("tensor_parallel_size") != TENSOR_PARALLEL:
     raise RuntimeError(f"vLLM ran with TP={backend_metadata.get('tensor_parallel_size')}, expected {TENSOR_PARALLEL}")
+if PARALLEL_MODE == "dp" and backend_metadata.get("data_parallel_size") != DATA_PARALLEL:
+    raise RuntimeError(f"vLLM ran with DP={backend_metadata.get('data_parallel_size')}, expected {DATA_PARALLEL}")
 if backend_metadata.get("attention_backend") != ATTENTION_BACKEND:
     raise RuntimeError(f"vLLM ran with attention backend {backend_metadata.get('attention_backend')}, expected {ATTENTION_BACKEND}")
-print(json.dumps(backend_metadata, indent=2))
+workers = backend_metadata.get("workers") or {}
+if not workers.get("workers"):
+    raise RuntimeError(f"worker memory telemetry is empty: {workers.get('error')}")
+prefix = backend_metadata.get("prefix_cache") or {}
+if prefix.get("reported_requests"):
+    print("prefix cache hit rate:", prefix)
+else:
+    print("WARNING: prefix cache counters were not reported by this engine build:",
+          prefix)
+    print("engine metrics field inventory:",
+          json.dumps(backend_metadata.get("metrics_shape"), indent=2, default=str))
+print(json.dumps({"backend": backend_metadata, "prefix_cache": prefix}, indent=2))
 '''),
     cell("markdown", "## 7. vLLM dev 基座/候选对照与 confirm 门禁"),
     cell("code", r'''
-VLLM = ["--backend", "vllm", "--tensor-parallel-size", str(TENSOR_PARALLEL),
+VLLM = ["--backend", "vllm",
+        "--tensor-parallel-size", str(TENSOR_PARALLEL),
+        "--data-parallel-size", str(DATA_PARALLEL),
         "--gpu-memory-utilization", str(GPU_MEMORY_UTILIZATION),
         "--attention-backend", ATTENTION_BACKEND,
         "--max-num-seqs", str(MAX_NUM_SEQS)]
@@ -324,7 +342,7 @@ CELLS[3]["source"] = secure_loader_source(
     extra_validation='''
 if manifest.get("training_cache_mode") != "embedded_complete":
     raise RuntimeError("training package does not contain the complete cache")
-if manifest.get("inference_engine") != "vllm_0.19.1_tensor_parallel":
+if manifest.get("inference_engine") != "vllm_0.19.1_dual_gpu":
     raise RuntimeError("training package was not built for the vLLM dual-GPU lane")
 ''',
     extra_prints='print("Package:", PACKAGE_ID)',

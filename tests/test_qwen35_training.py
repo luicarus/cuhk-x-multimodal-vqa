@@ -127,15 +127,47 @@ def test_qwen35_notebook_runs_vllm_on_two_gpus():
 
     notebook = json.loads((PROJECT / "notebooks/qwen35-4b-qlora-vllm.ipynb").read_text(encoding="utf-8"))
     source = "\n".join(cell["source"] for cell in notebook["cells"] if cell["cell_type"] == "code")
-    # Dual-GPU tensor parallelism is the point of this lane.
-    assert 'TENSOR_PARALLEL = 2' in source
+    # Using both GPUs is the point of this lane; the notebook selects the topology
+    # through PARALLEL_MODE so the tensor- and data-parallel rounds are both
+    # reproducible from one file.
+    assert 'PARALLEL_MODE = "dp"' in source
+    assert 'DATA_PARALLEL = 2 if PARALLEL_MODE == "dp" else 1' in source
+    assert 'TENSOR_PARALLEL = 1 if PARALLEL_MODE == "dp" else 2' in source
     assert '"--backend", "vllm"' in source
     assert '"--tensor-parallel-size", str(TENSOR_PARALLEL)' in source
+    assert '"--data-parallel-size", str(DATA_PARALLEL)' in source
     # vLLM cannot train, so training must stay on the Transformers trainer.
     training_calls = [line for line in source.splitlines() if 'cloud("train"' in line]
     assert training_calls and all("vllm" not in line for line in training_calls)
     # Both GPUs must be visible before vLLM starts.
     assert "device_count" in source
+    # The smoke gate must prove the topology it actually ran, not just that vLLM
+    # was used: a silent fallback to one GPU would otherwise pass.
+    assert "data_parallel_size" in source
+
+
+def test_qwen35_notebooks_gate_on_telemetry_and_prefix_cache():
+    """Worker telemetry must be present; a missing cache counter only warns.
+
+    Worker memory was silently empty in an earlier round because the RPC could
+    not serialize its function, so that one is a hard gate: an empty report means
+    the telemetry is broken. The prefix-cache counter is different -- it depends
+    on the engine build exposing the field at all, and aborting a 682-request run
+    over a diagnostic would be worse than the missing number. It warns and dumps
+    the real field inventory instead.
+    """
+    import json
+
+    for name in ("qwen35-4b-vllm.ipynb", "qwen35-4b-qlora-vllm.ipynb"):
+        notebook = json.loads((PROJECT / "notebooks" / name).read_text(encoding="utf-8"))
+        source = "\n".join(cell["source"] for cell in notebook["cells"] if cell["cell_type"] == "code")
+        assert 'workers = backend_metadata.get("workers") or {}' in source, name
+        assert 'if not workers.get("workers")' in source, name
+        assert 'prefix = backend_metadata.get("prefix_cache") or {}' in source, name
+        # Missing counters warn rather than raise, and the run records what the
+        # engine actually reported.
+        assert 'if prefix.get("reported_requests"):' in source, name
+        assert 'metrics_shape' in source, name
 
 
 def test_qwen35_vllm_backend_keeps_the_constrained_answer_space():
@@ -389,6 +421,218 @@ def test_qwen35_vllm_worker_telemetry_omits_missing_kv_cache():
 
     assert "kv_cache_mib" not in report
     assert "kv_cache_tokens" not in report
+
+
+def test_qwen35_vllm_allows_worker_rpc_serialization():
+    """Without the pickle fallback the worker RPC fails and telemetry is empty.
+
+    vLLM's default msgpack serializer rejects callables, so collective_rpc on a
+    function raised "Object of type <class 'function'> is not serializable" and
+    every worker figure was lost. The env var is what makes the channel accept
+    it; this test pins the setting so a later cleanup cannot drop it silently.
+    """
+    from cuhkx.inference.qwen35_vllm import VLLM_ENGINE_ENV
+
+    assert VLLM_ENGINE_ENV.get("VLLM_ALLOW_INSECURE_SERIALIZATION") == "1"
+
+
+def test_qwen35_vllm_rejects_tensor_and_data_parallel_together():
+    """Two GPUs are either split inside one replica or divided between replicas."""
+    from cuhkx.inference.qwen35_vllm import Qwen35VLLMBackend
+
+    with pytest.raises(ValueError, match="cannot both exceed 1"):
+        Qwen35VLLMBackend(
+            {"frames": {"input_image_size": 280}, "model": {}},
+            Path("/nonexistent"), tensor_parallel_size=2, data_parallel_size=2)
+
+
+def test_qwen35_vllm_round_robin_covers_every_request_once():
+    """Every request must land on exactly one replica, in input order."""
+    from cuhkx.inference.qwen35_vllm import Qwen35VLLMBackend
+
+    backend = Qwen35VLLMBackend.__new__(Qwen35VLLMBackend)
+    backend.engines = [object(), object()]
+
+    for size in (1, 2, 3, 4, 5, 16, 682):
+        assignments = backend._round_robin(size)
+        covered = []
+        for _, start, end in assignments:
+            covered.extend(range(start, end))
+        assert covered == list(range(size)), size
+        # Contiguous blocks, so each replica gets one engine call per dispatch.
+        for _, start, end in assignments:
+            assert end > start
+        assert sum(end - start for _, start, end in assignments) == size
+        assert len(assignments) <= 2
+
+
+def test_qwen35_vllm_prefix_cache_rate_is_measured_not_assumed():
+    """The hit rate must come from engine counters, and be absent if unreported."""
+    from cuhkx.inference.qwen35_vllm import Qwen35VLLMBackend
+
+    backend = Qwen35VLLMBackend.__new__(Qwen35VLLMBackend)
+    backend.prefix_cache_requests = 0
+    backend.prefix_cache_missing = 0
+    backend.prefix_cache_cached_tokens = 0
+    backend.prefix_cache_prompt_tokens = 0
+    backend.prefix_cache_summary = {}
+
+    # Engine reports the split for two requests.
+    backend._record_prefix_cache({"num_cached_tokens": 30, "num_prompt_tokens": 1000})
+    backend._record_prefix_cache({"num_cached_tokens": 10, "num_prompt_tokens": 1000})
+    backend._record_prefix_summary()
+    assert backend.prefix_cache_summary["cached_tokens"] == 40
+    assert backend.prefix_cache_summary["prompt_tokens"] == 2000
+    assert backend.prefix_cache_summary["hit_rate"] == 0.02
+    assert backend.prefix_cache_summary["reported_requests"] == 2
+
+    # A run whose engine never reports the field must say so, rather than
+    # reporting a hit rate of zero as if it had been measured.
+    bare = Qwen35VLLMBackend.__new__(Qwen35VLLMBackend)
+    bare.prefix_cache_requests = 0
+    bare.prefix_cache_missing = 0
+    bare.prefix_cache_cached_tokens = 0
+    bare.prefix_cache_prompt_tokens = 0
+    bare.prefix_cache_summary = {}
+    bare._record_prefix_cache({"reported": True, "first_token_latency": 0.1})
+    bare._record_prefix_summary()
+    assert bare.prefix_cache_summary["reported_requests"] == 0
+    assert bare.prefix_cache_summary["unreported_requests"] == 1
+    assert bare.prefix_cache_summary["hit_rate"] is None
+
+
+def test_qwen35_vllm_engine_metrics_reads_cached_tokens():
+    """The prefix-cache count must be found under whichever name the build uses."""
+    from cuhkx.inference.qwen35_vllm import _engine_metrics
+
+    class Stats:
+        first_token_latency = 0.5
+        num_prompt_tokens = 1200
+        num_cached_tokens = 48
+
+    class Output:
+        metrics = Stats()
+
+    metrics = _engine_metrics(Output())
+    assert metrics["reported"] is True
+    assert metrics["num_cached_tokens"] == 48
+    assert metrics["num_prompt_tokens"] == 1200
+
+    # The first data-parallel smoke run found num_cached_tokens absent on every
+    # request, so the alternative spellings and the nested containers are tried
+    # before giving up.
+    class Alternative:
+        num_prompt_tokens = 500
+        num_prefix_cached_tokens = 12
+
+    class AltOutput:
+        metrics = Alternative()
+
+    assert _engine_metrics(AltOutput())["num_cached_tokens"] == 12
+
+    class Nested:
+        num_prompt_tokens = 500
+        class kv_cache_metrics:
+            num_cached_tokens = 7
+
+    class NestedOutput:
+        metrics = Nested()
+
+    assert _engine_metrics(NestedOutput())["num_cached_tokens"] == 7
+
+    # Absent must stay absent, so "not measured" never reads as "measured zero".
+    class NoneReported:
+        num_prompt_tokens = 500
+
+    class NoneOutput:
+        metrics = NoneReported()
+
+    assert "num_cached_tokens" not in _engine_metrics(NoneOutput())
+
+
+def test_qwen35_vllm_records_the_real_metrics_shape():
+    """An absent counter must diagnose itself instead of failing silently."""
+    from cuhkx.inference.qwen35_vllm import describe_engine_metrics
+
+    class Stats:
+        num_prompt_tokens = 900
+        first_token_latency = 0.25
+
+    class Output:
+        metrics = Stats()
+
+    shape = describe_engine_metrics(Output())
+    assert "num_prompt_tokens" in shape["fields"]
+    assert shape["values"]["num_prompt_tokens"] == 900
+    assert shape["metrics_is_none"] is False
+
+    class NoStats:
+        metrics = None
+
+    assert describe_engine_metrics(NoStats())["metrics_is_none"] is True
+
+
+def test_cli_records_data_parallel_size_in_engine_options():
+    """DP changes the topology, so it belongs in the signed contract."""
+    from cuhkx.cli import engine_options
+
+    class Args:
+        backend = "vllm"
+        tensor_parallel_size = 1
+        data_parallel_size = 2
+        gpu_memory_utilization = 0.8
+        attention_backend = "TRITON_ATTN"
+        max_num_seqs = 16
+        adapter_dir = None
+
+    options = engine_options(Args(), "qwen35")
+    assert options["data_parallel_size"] == 2
+    assert options["tensor_parallel_size"] == 1
+    assert options["max_num_seqs"] == 16
+
+
+def test_cli_rejects_tensor_and_data_parallel_together():
+    from cuhkx.cli import resolve_backend
+
+    class Args:
+        backend = "vllm"
+        tensor_parallel_size = 2
+        data_parallel_size = 2
+        adapter_dir = None
+
+    with pytest.raises(ValueError, match="not both"):
+        resolve_backend(Args(), "qwen35")
+
+
+def test_qwen35_vllm_replica_process_is_not_daemonic():
+    """A daemonic replica cannot spawn vLLM's own workers.
+
+    vLLM builds several processes beneath the replica process, and
+    multiprocessing refuses to let a daemon have children:
+
+        AssertionError: daemonic processes are not allowed to have children
+
+    The first data-parallel smoke run died exactly there, before any request was
+    served. Daemon mode would have auto-reaped the replicas, so the cleanup it
+    provided has to come from close() plus the atexit registry instead.
+    """
+    source = (PROJECT / "src/cuhkx/inference/qwen35_vllm.py").read_text(encoding="utf-8")
+    assert "daemon=False" in source
+    assert "daemon=True" not in source
+    # The replacement for daemon-mode cleanup.
+    assert "atexit.register" in source
+    assert "def _terminate_replicas" in source
+
+
+def test_runner_releases_the_backend_after_a_run():
+    """Data-parallel replicas must not outlive the run that started them."""
+    source = (PROJECT / "src/cuhkx/inference/runner.py").read_text(encoding="utf-8")
+    # Anchor on the call site, not the helper definition that appears earlier.
+    call = source.index("        _release_backend(backend)\n        return summary")
+    # Cleanup happens after the summary is written, since metadata() samples the
+    # worker memory that only exists while the engine is alive.
+    assert source.index("write_json(summary_path, summary)") < call
+    assert "def _release_backend(backend)" in source
 
 
 def test_qwen35_notebooks_pin_the_attention_backend():

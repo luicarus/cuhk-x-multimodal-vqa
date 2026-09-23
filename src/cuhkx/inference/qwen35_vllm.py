@@ -40,6 +40,19 @@ VLLM_ENGINE_ENV = {
     "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
     "VLLM_NO_USAGE_STATS": "1",
     "VLLM_USE_FLASHINFER_SAMPLER": "0",
+    # Worker telemetry travels over vLLM's RPC channel, whose default msgpack
+    # serializer refuses arbitrary Python callables:
+    #
+    #     TypeError: Object of type <class 'function'> is not serializable
+    #     Set VLLM_ALLOW_INSECURE_SERIALIZATION=1 to allow fallback to pickle
+    #
+    # Without this the RPC in worker_memory() fails and *every* worker figure is
+    # lost, which is why an earlier run reported allocated_mib: 0 on both cards
+    # and workers: []. The channel only ever links this process to the vLLM
+    # workers it spawned itself, and carries nothing but our own telemetry
+    # function, so the pickle fallback is acceptable here. Insecure means "do not
+    # expose this channel to untrusted peers", not "unsafe in this process tree".
+    "VLLM_ALLOW_INSECURE_SERIALIZATION": "1",
     # FlashInfer/Triton JIT need a writable cache even on a read-only dataset.
     "TRITON_CACHE_DIR": "/tmp/cuhkx_triton_cache",
     "TORCHINDUCTOR_CACHE_DIR": "/tmp/cuhkx_inductor_cache",
@@ -136,13 +149,34 @@ def _render_reference(tokenizer, prompt: str) -> str:
 
 
 class Qwen35VLLMBackend:
-    """Offline multi-GPU vLLM engine constrained to the lane's answer space."""
+    """Offline multi-GPU vLLM engine constrained to the lane's answer space.
+
+    Two ways to use both T4s, and they are not interchangeable:
+
+    * Tensor parallelism (``tensor_parallel_size=2``) splits every layer across
+      the cards, so one request is served by both GPUs and every forward pass
+      pays a PCIe all-reduce. Two T4s have no NVLink.
+    * Data parallelism (``data_parallel_size=2``, ``tensor_parallel_size=1``)
+      gives each card its own complete engine and routes different requests to
+      different cards, so there is no cross-card communication at all. Each card
+      must hold the whole model and its own KV cache.
+
+    On PCIe-only T4s the second is often the better trade: independence removes
+    the all-reduce that dominates short-prefill, tiny-decode workloads like this
+    one. Which one actually wins is an empirical question, so both are selectable
+    and the chosen topology is recorded in the signed contract.
+    """
 
     def __init__(self, baseline: dict, weights: Path, adapter: Path | None = None,
                  *, tensor_parallel_size: int = 2, gpu_memory_utilization: float = 0.80,
                  enable_prefix_caching: bool = True, max_model_len: int = 4096,
-                 attention_backend: str = "TRITON_ATTN", max_num_seqs: int = 1):
+                 attention_backend: str = "TRITON_ATTN", max_num_seqs: int = 1,
+                 data_parallel_size: int = 1):
         require(tensor_parallel_size >= 1, "tensor parallel size must be positive")
+        require(data_parallel_size >= 1, "data parallel size must be positive")
+        require(not (data_parallel_size > 1 and tensor_parallel_size > 1),
+                "tensor and data parallelism cannot both exceed 1: the free GPUs are "
+                "either split inside one replica or divided between replicas")
         require(0.0 < gpu_memory_utilization < 1.0, "gpu memory utilization must be a fraction")
         require(max_model_len >= 1024, "max_model_len is implausibly small")
         require(attention_backend in ATTENTION_BACKENDS,
@@ -157,16 +191,32 @@ class Qwen35VLLMBackend:
 
         require(weights.is_dir(), "Qwen3.5 weight directory is missing")
         available = torch.cuda.device_count()
-        require(available >= tensor_parallel_size,
-                f"vLLM tensor_parallel_size={tensor_parallel_size} needs {tensor_parallel_size} "
-                f"visible CUDA devices, found {available}")
+        required = tensor_parallel_size * data_parallel_size
+        require(available >= required,
+                f"vLLM needs {required} visible CUDA devices for "
+                f"tensor_parallel_size={tensor_parallel_size} x "
+                f"data_parallel_size={data_parallel_size}, found {available}")
 
         self.SamplingParams = SamplingParams
         self.StructuredOutputsParams = StructuredOutputsParams
         self.image_size = baseline["frames"]["input_image_size"]
         self.tensor_parallel_size = tensor_parallel_size
+        self.data_parallel_size = data_parallel_size
         self.attention_backend = attention_backend
         self.max_num_seqs = max_num_seqs
+        self.engines = []
+        self._dispatch_index = 0
+        # Prefix-cache accounting is accumulated across the run and summarized in
+        # metadata(); a run that never sees the fields reports zero coverage
+        # rather than a flattering zero hit rate.
+        self.prefix_cache_requests = 0
+        self.prefix_cache_missing = 0
+        self.prefix_cache_cached_tokens = 0
+        self.prefix_cache_prompt_tokens = 0
+        self.prefix_cache_summary = {}
+        # Filled from the first finished request so the summary carries the real
+        # field inventory of this vLLM build.
+        self.metrics_shape = None
 
         started = time.perf_counter()
         # use_fast=False mirrors the reference backend: the slow image processor
@@ -174,14 +224,13 @@ class Qwen35VLLMBackend:
         self.processor = AutoProcessor.from_pretrained(
             str(weights), local_files_only=True, trust_remote_code=False, use_fast=False,
         )
-        self.engine = LLM(
+        engine_kwargs = dict(
             model=str(weights),
             revision=baseline["model"].get("revision") or None,
             tokenizer=str(weights),
             tokenizer_revision=baseline["model"].get("revision") or None,
             trust_remote_code=False,
             dtype="float16",
-            tensor_parallel_size=tensor_parallel_size,
             gpu_memory_utilization=gpu_memory_utilization,
             max_model_len=max_model_len,
             enforce_eager=True,
@@ -202,12 +251,63 @@ class Qwen35VLLMBackend:
             limit_mm_per_prompt={"image": 4},
             mm_processor_kwargs={"use_fast": False},
         )
+        if data_parallel_size > 1:
+            # One whole replica per GPU. vLLM has no in-process DP for the
+            # offline LLM entry point that also lets each replica own a distinct
+            # device, so the replicas are built in child processes, each with
+            # CUDA_VISIBLE_DEVICES pinned to its own card. The children own the
+            # engines; this process only dispatches plain data to them.
+            self.engine = None
+            self.engines = [_ReplicaHandle(index, engine_kwargs, weights)
+                            for index in range(data_parallel_size)]
+            self.adapter_request = None
+            self.last_metrics = {"reported": False}
+            self.load_seconds = time.perf_counter() - started
+            return
+        self.engine = LLM(
+            tensor_parallel_size=tensor_parallel_size,
+            **engine_kwargs,
+        )
         self.adapter_request = None
         # Populated per request; absent until generate() has run.
         self.last_metrics = {"reported": False}
         if adapter is not None:
             self.adapter_request = self._register_adapter(adapter)
         self.load_seconds = time.perf_counter() - started
+
+    @property
+    def _data_parallel_replicas(self):
+        """The data-parallel replicas, or an empty list in the other modes.
+
+        Read through an accessor rather than the attribute directly: tests build
+        this class with ``__new__`` to exercise single methods, and those
+        instances never ran ``__init__``, so ``self.engines`` is not set on them.
+        """
+        return getattr(self, "engines", None) or []
+
+    @property
+    def replicas(self):
+        """The engines requests are dispatched to, one per data-parallel rank."""
+        replicas = self._data_parallel_replicas
+        return replicas if replicas else [self.engine]
+
+    def _round_robin(self, size):
+        """Distribute ``size`` requests over the replicas, in order.
+
+        Contiguous blocks rather than interleaving: each replica then sees one
+        engine call per dispatch, which is what makes the batched timing a
+        meaningful per-replica figure instead of a mix of two engines.
+        """
+        replicas = self.replicas
+        count = len(replicas)
+        base, extra = divmod(size, count)
+        assignments, start = [], 0
+        for index in range(count):
+            length = base + (1 if index < extra else 0)
+            if length:
+                assignments.append((index, start, start + length))
+            start += length
+        return assignments
 
     def _register_adapter(self, adapter: Path):
         """Load the verified LoRA adapter through vLLM's own loader.
@@ -244,6 +344,19 @@ class Qwen35VLLMBackend:
         content.append({"type": "text", "text": prompt})
         messages = [{"role": "user", "content": content}]
 
+        if self._data_parallel_replicas:
+            # Data parallel: the request goes to one replica, chosen in turn so
+            # consecutive requests spread across the cards. The replica builds
+            # its own SamplingParams, so none is built here.
+            replica = self.replicas[self._dispatch_index % len(self.replicas)]
+            self._dispatch_index += 1
+            response = replica.chat([messages], [list(outputs)], max_new_tokens)
+            answers = response.get("answers") or []
+            require(len(answers) == 1, "vLLM replica returned an unexpected number of results")
+            metrics = (response.get("metrics") or [{}])[0]
+            self.last_metrics = dict(metrics)
+            self._record_prefix_cache(metrics)
+            return answers[0]
         parameters = self.SamplingParams(
             temperature=0.0,
             top_p=1.0,
@@ -273,6 +386,7 @@ class Qwen35VLLMBackend:
         # request arrival, so it includes queueing and excludes our own image
         # encoding -- exactly the split worth reporting.
         self.last_metrics = _engine_metrics(output)
+        self._record_prefix_cache(self.last_metrics)
         return output.outputs[0].text.strip()
 
     def generate_batch(self, batch, *, max_new_tokens):
@@ -309,20 +423,76 @@ class Qwen35VLLMBackend:
         # versus ordered multi-select), and one shared constraint would let a
         # request emit another request's answers. engine.chat pairs a sequence of
         # parameters with the prompts one by one.
-        parameters = [
-            self.SamplingParams(
-                temperature=0.0,
-                top_p=1.0,
-                max_tokens=max_new_tokens,
-                skip_special_tokens=True,
-                # ``choice`` takes literal answer strings; a regex would be
-                # escaped into the grammar and the model would answer with the
-                # literal pattern characters.
-                structured_outputs=self.StructuredOutputsParams(choice=list(outputs)),
-            )
-            for _, _, outputs in batch
-        ]
+        #
+        # In data-parallel mode the parameters are built inside each replica
+        # process from the plain answer lists, so the parent has no vLLM objects
+        # to construct and nothing vLLM-specific crosses the process boundary.
+        parameters = None
+        if not self._data_parallel_replicas:
+            parameters = [
+                self.SamplingParams(
+                    temperature=0.0,
+                    top_p=1.0,
+                    max_tokens=max_new_tokens,
+                    skip_special_tokens=True,
+                    # ``choice`` takes literal answer strings; a regex would be
+                    # escaped into the grammar and the model would answer with the
+                    # literal pattern characters.
+                    structured_outputs=self.StructuredOutputsParams(choice=list(outputs)),
+                )
+                for _, _, outputs in batch
+            ]
         started = time.perf_counter()
+        if self._data_parallel_replicas:
+            # Data parallel: split the batch into one contiguous block per
+            # replica and run the blocks as parallel engine calls. The wall clock
+            # of the slowest replica is the batch cost, because a batch is only
+            # finished when every request in it is.
+            import concurrent.futures
+
+            replicas = self._data_parallel_replicas
+            answers = [None] * len(batch)
+            metrics = [None] * len(batch)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(replicas)) as pool:
+                futures = []
+                for replica_index, start, end in self._round_robin(len(batch)):
+                    futures.append((start, end, pool.submit(
+                        self.replicas[replica_index].chat,
+                        conversations[start:end],
+                        [list(allowed) for _, _, allowed in batch[start:end]],
+                        max_new_tokens,
+                    )))
+                for start, end, future in futures:
+                    response = future.result()
+                    block = response.get("answers") or []
+                    block_metrics = response.get("metrics") or [{}] * (end - start)
+                    require(len(block) == end - start,
+                            "vLLM replica returned the wrong number of results")
+                    answers[start:end] = block
+                    metrics[start:end] = block_metrics
+                    if response.get("metrics_shape") and self.metrics_shape is None:
+                        self.metrics_shape = response["metrics_shape"]
+            generate_seconds = time.perf_counter() - started
+            require(all(isinstance(value, str) for value in answers),
+                    "a data-parallel replica returned no answer")
+            self._record_prefix_cache_batch(metrics)
+            reported = [value for value in metrics if value.get("reported")]
+            self.last_metrics = {
+                "reported": bool(reported),
+                "first_token_latency_max": max((float(v.get("first_token_latency", 0.0))
+                                                for v in reported), default=None),
+                "first_token_latency_mean": (sum(float(v.get("first_token_latency", 0.0))
+                                                 for v in reported) / len(reported)) if reported else None,
+                "num_generation_tokens": sum(int(v.get("num_generation_tokens", 0))
+                                             for v in reported) or None,
+                "num_prompt_tokens": sum(int(v.get("num_prompt_tokens", 0))
+                                         for v in reported) or None,
+                "batch_generate_seconds": generate_seconds,
+                "batch_size": len(batch),
+                "data_parallel_size": len(replicas),
+            }
+            self._record_prefix_summary()
+            return answers
         results = self.engine.chat(
             conversations,
             sampling_params=parameters,
@@ -336,6 +506,9 @@ class Qwen35VLLMBackend:
         answers = [result.outputs[0].text.strip() for result in results]
         # Engine-side aggregates over the batch, for the runner to record.
         metrics = [_engine_metrics(result) for result in results]
+        if self.metrics_shape is None and results:
+            self.metrics_shape = describe_engine_metrics(results[0])
+        self._record_prefix_cache_batch(metrics)
         reported = [value for value in metrics if value.get("reported")]
         self.last_metrics = {
             "reported": bool(reported),
@@ -350,7 +523,69 @@ class Qwen35VLLMBackend:
             "batch_generate_seconds": generate_seconds,
             "batch_size": len(batch),
         }
+        self._record_prefix_summary()
         return answers
+
+    def _prefix_counters(self):
+        """The prefix-cache counters, created on first use.
+
+        Read through a helper so a backend built with ``__new__`` in a test, which
+        never ran ``__init__``, still records instead of raising an
+        AttributeError from inside the request path.
+        """
+        for name in ("prefix_cache_requests", "prefix_cache_missing",
+                     "prefix_cache_cached_tokens", "prefix_cache_prompt_tokens"):
+            if not hasattr(self, name):
+                setattr(self, name, 0)
+        return self
+
+    @property
+    def metrics_shape(self):
+        """Field inventory of the engine's stats, or None before the first call.
+
+        A property with a default rather than an attribute, so instances built
+        with ``__new__`` in tests behave like constructed ones.
+        """
+        return getattr(self, "_metrics_shape", None)
+
+    @metrics_shape.setter
+    def metrics_shape(self, value):
+        self._metrics_shape = value
+
+    def _record_prefix_cache(self, metrics):
+        """Accumulate prefix-cache reuse from one finished request.
+
+        vLLM reports how many of a request's prompt tokens it served from the
+        prefix cache rather than recomputing. The hit *rate* is what makes the
+        optimisation's value measurable: on this lane every request carries four
+        distinct images, so the only reusable prefix is the chat template, and
+        the rate is expected to be near zero. Measuring it turns that expectation
+        into evidence.
+        """
+        self._prefix_counters()
+        cached = metrics.get("num_cached_tokens") if isinstance(metrics, dict) else None
+        prompt = metrics.get("num_prompt_tokens") if isinstance(metrics, dict) else None
+        if cached is None:
+            self.prefix_cache_missing += 1
+            return
+        self.prefix_cache_cached_tokens += int(cached)
+        self.prefix_cache_requests += 1
+        if prompt:
+            self.prefix_cache_prompt_tokens += int(prompt)
+    def _record_prefix_cache_batch(self, metrics):
+        for entry in metrics:
+            self._record_prefix_cache(entry)
+
+    def _record_prefix_summary(self):
+        self._prefix_counters()
+        self.prefix_cache_summary = {
+            "reported_requests": self.prefix_cache_requests,
+            "unreported_requests": self.prefix_cache_missing,
+            "cached_tokens": self.prefix_cache_cached_tokens,
+            "prompt_tokens": self.prefix_cache_prompt_tokens,
+            "hit_rate": (round(self.prefix_cache_cached_tokens / self.prefix_cache_prompt_tokens, 6)
+                         if self.prefix_cache_prompt_tokens else None),
+        }
 
     def worker_memory(self):
         """Per-worker GPU memory, sampled inside each vLLM worker process.
@@ -359,11 +594,36 @@ class Qwen35VLLMBackend:
         exited, or a failure inside the RPC, is reported as an error string
         rather than raised: telemetry must never fail a prediction run.
         """
+        if self._data_parallel_replicas:
+            # Each replica owns a card outright, so it reports its own memory
+            # from its own process; no collective RPC is involved.
+            workers, errors = [], []
+            for replica in self._data_parallel_replicas:
+                try:
+                    memory = replica.worker_memory()
+                except Exception as error:      # noqa: BLE001 - telemetry only
+                    errors.append(f"replica {replica.index}: {type(error).__name__}: {error}")
+                    continue
+                if memory:
+                    workers.append({**memory, "replica": replica.index})
+            return {"workers": workers, "error": "; ".join(errors) or None}
         try:
             results = self.engine.collective_rpc(_worker_telemetry)
         except Exception as error:              # noqa: BLE001 - telemetry only
             return {"workers": [], "error": f"{type(error).__name__}: {error}"}
         return {"workers": list(results), "error": None}
+
+    def close(self):
+        """Release data-parallel replicas.
+
+        Each replica is a child process holding a full model, so leaving them
+        alive after the run would keep most of both cards reserved. A no-op in
+        tensor-parallel mode, where the engine lives in this process.
+        """
+        for replica in self._data_parallel_replicas:
+            replica.close()
+        if getattr(self, "engines", None):
+            self.engines = []
 
     def metadata(self):
         import os
@@ -375,9 +635,12 @@ class Qwen35VLLMBackend:
         # model and KV cache, and they are gone once the object is released.
         return {
             "backend": "qwen35_4b_vllm",
-            "model_class": type(self.engine).__name__,
+            "model_class": "DP" if self._data_parallel_replicas else type(self.engine).__name__,
             "image_size": self.image_size,
             "tensor_parallel_size": self.tensor_parallel_size,
+            "data_parallel_size": self.data_parallel_size if self._data_parallel_replicas else None,
+            "parallelism": ("data" if self._data_parallel_replicas else
+                            ("tensor" if self.tensor_parallel_size > 1 else "single")),
             "attention_backend": self.attention_backend,
             "max_num_seqs": self.max_num_seqs,
             "enforce_eager": True,
@@ -387,6 +650,12 @@ class Qwen35VLLMBackend:
             "load_seconds": self.load_seconds,
             "workers": self.worker_memory(),
             "image_encode_ms_last": round(getattr(self, "last_encode_seconds", 0.0) * 1000.0, 3),
+            # Measured, not assumed: a near-zero hit rate is the expected result
+            # on this workload and is reported either way.
+            "prefix_cache": self.prefix_cache_summary,
+            # What the engine's stats object really contains, for when the
+            # counter above comes back empty.
+            "metrics_shape": getattr(self, "metrics_shape", None),
             "versions": runtime,
             "engine_environment": {name: os.environ.get(name) for name in VLLM_ENGINE_ENV},
         }
@@ -399,6 +668,13 @@ def _engine_metrics(output) -> dict:
     leaves it None on others, and the field set has moved between releases. This
     reads what is present and reports nothing rather than guessing, so a missing
     TTFT is visible as missing instead of silently becoming zero.
+
+    Prefix-cache reuse is searched for across the plausible spellings instead of
+    one fixed name. ``num_cached_tokens`` was the documented field, but the first
+    data-parallel smoke run reported every request as unreported, so the value --
+    if this build exposes it at all -- lives under a different name or on a
+    nested object. Enumerating candidates is deliberate: the engine's field set
+    is the authority here, not this file.
     """
     stats = getattr(output, "metrics", None)
     if stats is None:
@@ -409,9 +685,80 @@ def _engine_metrics(output) -> dict:
         value = getattr(stats, name, None)
         if value is not None:
             values[name] = value
+    cached = _find_cached_tokens(stats)
+    if cached is not None:
+        values["num_cached_tokens"] = cached
     if not values:
         return {"reported": False}
     return {"reported": True, **values}
+
+
+# Spellings seen across vLLM releases for "prompt tokens served from the prefix
+# cache". Checked on the stats object and one level into its nested metrics.
+_CACHED_TOKEN_FIELDS = (
+    "num_cached_tokens",
+    "num_prefix_cached_tokens",
+    "cached_tokens",
+    "prefix_cache_hit_tokens",
+    "num_cached_prompt_tokens",
+)
+
+
+def _find_cached_tokens(stats):
+    """Locate the prefix-cache reuse count on a stats object, or return None.
+
+    Searched at the top level and one level down (``kv_cache_metrics`` and
+    friends), because the value has been both a direct attribute and a nested
+    one. Returns None rather than 0 when nothing is found, so "absent" and
+    "measured zero" stay distinguishable -- collapsing them is exactly how a
+    missing metric turns into a flattering hit rate.
+    """
+    for field in _CACHED_TOKEN_FIELDS:
+        value = getattr(stats, field, None)
+        if isinstance(value, (int, float)):
+            return value
+    for container_name in ("kv_cache_metrics", "prefix_cache_stats", "cache_metrics"):
+        container = getattr(stats, container_name, None)
+        if container is None:
+            continue
+        for field in _CACHED_TOKEN_FIELDS:
+            value = getattr(container, field, None)
+            if isinstance(value, (int, float)):
+                return value
+    return None
+
+
+def describe_engine_metrics(output) -> dict:
+    """Field inventory of a finished request's stats object.
+
+    Used to discover what this vLLM build actually reports. Guessing field names
+    from documentation already produced one wrong probe, so the run records the
+    real attribute set and the whole nested object, and the reader decides
+    instead of the code assuming.
+    """
+    stats = getattr(output, "metrics", None)
+    if stats is None:
+        return {"metrics_is_none": True}
+    def public(obj):
+        return sorted(name for name in dir(obj)
+                      if not name.startswith("_") and not callable(getattr(obj, name, None)))
+    report = {"metrics_is_none": False, "fields": public(stats)}
+    for container_name in ("kv_cache_metrics", "prefix_cache_stats", "cache_metrics"):
+        container = getattr(stats, container_name, None)
+        if container is not None:
+            report[container_name] = {
+                "type": type(container).__name__,
+                "fields": public(container),
+                "values": {name: getattr(container, name, None)
+                           for name in public(container)},
+            }
+    report["values"] = {}
+    for name in ("num_prompt_tokens", "num_cached_tokens", "num_generation_tokens",
+                 "first_token_latency", "e2e_latency"):
+        value = getattr(stats, name, None)
+        if value is not None:
+            report["values"][name] = value
+    return report
 
 
 def _worker_telemetry(worker):
@@ -465,6 +812,248 @@ def _installed(name: str) -> bool:
     except importlib.metadata.PackageNotFoundError:
         return False
     return True
+
+
+# Live replica processes, terminated at interpreter exit.
+#
+# The replicas cannot be daemons (vLLM spawns workers beneath them), so nothing
+# reaps them automatically. A prediction run that raises, or a notebook cell that
+# is interrupted, would otherwise leave a process holding most of a GPU until the
+# session is reset. Registration is best-effort and never raises: it exists to
+# release hardware, not to police shutdown.
+_REPLICA_PROCESSES = []
+
+
+def _register_replica_cleanup(process) -> None:
+    import atexit
+
+    if not _REPLICA_PROCESSES:
+        atexit.register(_terminate_replicas)
+    _REPLICA_PROCESSES.append(process)
+
+
+def _terminate_replicas() -> None:                # pragma: no cover - exit path
+    while _REPLICA_PROCESSES:
+        process = _REPLICA_PROCESSES.pop()
+        try:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=10)
+        except Exception:                         # noqa: BLE001 - shutdown only
+            pass
+
+
+class _ReplicaHandle:
+    """One data-parallel replica: a whole vLLM engine on its own GPU.
+
+    The engine cannot be built in this process. ``CUDA_VISIBLE_DEVICES`` is read
+    by CUDA at initialization and is process-wide, so two engines wanting
+    different cards cannot coexist here. Each replica therefore lives in a child
+    process that is spawned with the variable already set for its card, and the
+    parent talks to it over a queue pair.
+
+    Only plain data crosses the boundary: rendered conversations, per-request
+    answer choices, and back the answer strings plus JSON-able metrics. Nothing
+    from vLLM is pickled in either direction, which keeps the message format
+    independent of the engine version.
+    """
+
+    def __init__(self, index: int, engine_kwargs: dict, weights: Path):
+        self.index = index
+        self._connection = None
+        self._process = None
+        self._spawn(engine_kwargs, weights)
+        # The child reports a failure during construction rather than leaving the
+        # parent to time out on the first request.
+        status = self._call({"op": "ready"})
+        require(status.get("ok"), f"data-parallel replica {index} failed to start: "
+                                  f"{status.get('error')}")
+        self.load_seconds = float(status.get("load_seconds") or 0.0)
+
+    def _spawn(self, engine_kwargs: dict, weights: Path):
+        import multiprocessing
+
+        context = multiprocessing.get_context("spawn")
+        parent_connection, child_connection = context.Pipe()
+        process = context.Process(
+            target=_replica_main,
+            args=(child_connection, self.index, engine_kwargs, str(weights)),
+            # NOT a daemon. vLLM spawns its own worker processes beneath this one,
+            # and multiprocessing forbids a daemonic process from having children:
+            #
+            #     AssertionError: daemonic processes are not allowed to have children
+            #
+            # Daemon mode would have cleaned the replica up automatically when the
+            # parent exits, but it cannot coexist with vLLM's own process tree.
+            # Cleanup is therefore explicit: close() terminates each replica, and
+            # atexit covers the paths where the caller forgets.
+            daemon=False,
+        )
+        process.start()
+        # The child holds its own copy; closing here is what lets the parent see
+        # EOF if the child dies mid-run instead of blocking forever.
+        child_connection.close()
+        self._connection = parent_connection
+        self._process = process
+        _register_replica_cleanup(process)
+
+    def _call(self, message: dict) -> dict:
+        require(self._process is not None and self._process.is_alive(),
+                f"data-parallel replica {self.index} is not running")
+        try:
+            self._connection.send(message)
+            response = self._connection.recv()
+        except (EOFError, OSError) as error:
+            raise RuntimeError(f"data-parallel replica {self.index} stopped responding: "
+                               f"{error}") from error
+        if not response.get("ok"):
+            raise RuntimeError(f"data-parallel replica {self.index}: {response.get('error')}")
+        return response
+
+    def chat(self, conversations, choices, max_new_tokens):
+        """Run one engine call carrying a list of conversations.
+
+        The child builds its own SamplingParams from the plain answer lists, so
+        no vLLM object is ever pickled across the process boundary.
+        """
+        return self._call({
+            "op": "chat",
+            "conversations": conversations,
+            "choices": [list(entry) for entry in choices],
+            "max_tokens": int(max_new_tokens),
+        })
+
+    def worker_memory(self):
+        """Ask this replica for its own device memory, measured in its process.
+
+        This is the only place the figure can come from: the replica process --
+        not the parent -- holds the weights and the KV cache.
+        """
+        return self._call({"op": "memory"}).get("memory")
+
+    def close(self):
+        if self._process is None:
+            return
+        try:
+            if self._process.is_alive():
+                self._connection.send({"op": "stop"})
+                self._process.join(timeout=30)
+        except (EOFError, OSError, ValueError):
+            pass
+        finally:
+            if self._process.is_alive():
+                self._process.terminate()
+                self._process.join(timeout=10)
+            # Deregister so the atexit hook does not try to reap it again.
+            if self._process in _REPLICA_PROCESSES:
+                _REPLICA_PROCESSES.remove(self._process)
+            try:
+                self._connection.close()
+            except OSError:
+                pass
+            self._process = None
+
+    def __del__(self):                # pragma: no cover - defensive cleanup only
+        try:
+            self.close()
+        except Exception:             # noqa: BLE001 - destructors must not raise
+            pass
+
+
+def _replica_main(connection, index, engine_kwargs, weights):
+    """Child-process body for one data-parallel replica.
+
+    Runs with CUDA_VISIBLE_DEVICES set to a single card, so the engine it builds
+    sees exactly one device and needs no tensor parallelism. Everything it sends
+    back is plain data.
+    """
+    import os
+    import traceback
+
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(index)
+    # vLLM reads several of these at import time, so the environment is applied
+    # before the engine module is touched.
+    apply_engine_environment()
+
+    state = {"engine": None, "sampling": None, "structured": None}
+
+    def reply(payload):
+        connection.send({"ok": True, **payload})
+
+    def fail(error):
+        connection.send({"ok": False, "error": f"{type(error).__name__}: {error}"})
+
+    try:
+        import time as _time
+
+        from vllm import LLM, SamplingParams
+        from vllm.sampling_params import StructuredOutputsParams
+
+        started = _time.perf_counter()
+        engine = LLM(tensor_parallel_size=1, **engine_kwargs)
+        state.update(engine=engine, sampling=SamplingParams, structured=StructuredOutputsParams)
+        load_seconds = _time.perf_counter() - started
+    except Exception as error:            # noqa: BLE001 - reported to the parent
+        try:
+            connection.send({
+                "ok": False,
+                "error": f"{type(error).__name__}: {error}",
+                "traceback": traceback.format_exc(),
+            })
+            connection.close()
+        finally:
+            return
+
+    try:
+        while True:
+            try:
+                message = connection.recv()
+            except EOFError:
+                break
+            operation = message.get("op")
+            if operation == "stop":
+                break
+            if operation == "ready":
+                reply({"load_seconds": load_seconds})
+                continue
+            if operation == "memory":
+                reply({"memory": _worker_telemetry(None)})
+                continue
+            if operation == "chat":
+                try:
+                    parameters = [
+                        state["sampling"](
+                            temperature=0.0, top_p=1.0,
+                            max_tokens=int(message.get("max_tokens") or 8),
+                            skip_special_tokens=True,
+                            structured_outputs=state["structured"](choice=list(choices)),
+                        )
+                        for choices in message["choices"]
+                    ]
+                    results = state["engine"].chat(
+                        message["conversations"],
+                        sampling_params=parameters,
+                        use_tqdm=False,
+                        add_generation_prompt=True,
+                        chat_template_kwargs={"enable_thinking": False},
+                    )
+                    reply({
+                        "answers": [result.outputs[0].text.strip() for result in results],
+                        "metrics": [_engine_metrics(result) for result in results],
+                        # Send the real stats shape once so the parent can record
+                        # which fields this vLLM build actually provides.
+                        "metrics_shape": (describe_engine_metrics(results[0])
+                                          if results else None),
+                    })
+                except Exception as error:        # noqa: BLE001 - per-request guard
+                    fail(error)
+                continue
+            fail(ValueError(f"unknown operation: {operation!r}"))
+    finally:
+        try:
+            connection.close()
+        except OSError:
+            pass
 
 
 def _data_uri(image) -> str:

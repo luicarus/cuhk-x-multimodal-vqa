@@ -27,7 +27,7 @@ def evaluation_input(config, settings, split):
 
 def evaluate_training(config, settings, split, run_id, weights, adapter=None, resume=False,
                       backend=None, tensor_parallel_size=2, gpu_memory_utilization=0.80,
-                      attention_backend="TRITON_ATTN", max_num_seqs=1):
+                      attention_backend="TRITON_ATTN", max_num_seqs=1, data_parallel_size=1):
     prepared, samples = evaluation_input(config, settings, split)
     qwen35 = config["baseline"]["model"]["id"] == "Qwen/Qwen3.5-4B"
     engine = backend or ("vllm" if qwen35 else "transformers")
@@ -47,12 +47,15 @@ def evaluate_training(config, settings, split, run_id, weights, adapter=None, re
         backend_factory = lambda: Qwen35VLLMBackend(
             config["baseline"], weights, adapter=adapter,
             tensor_parallel_size=tensor_parallel_size,
+            data_parallel_size=data_parallel_size,
             gpu_memory_utilization=gpu_memory_utilization,
             attention_backend=attention_backend, max_num_seqs=max_num_seqs)
         engine_options = {"tensor_parallel_size": tensor_parallel_size,
                           "gpu_memory_utilization": gpu_memory_utilization,
                           "attention_backend": attention_backend,
                           "max_num_seqs": max_num_seqs}
+        if data_parallel_size > 1:
+            engine_options["data_parallel_size"] = data_parallel_size
     elif qwen35:
         from cuhkx.inference.qwen35 import Qwen35Backend
         backend_factory = lambda: Qwen35Backend(config["baseline"], weights, adapter=adapter)
