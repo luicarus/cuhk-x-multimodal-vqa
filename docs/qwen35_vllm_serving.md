@@ -27,6 +27,15 @@ V2 和 V3 还记录了 output token rate（2.9927 / 3.2411 tokens/s），但输�
 
 DP2-B16 与 TP2-B32 有 675/682 条预测一致，7 条输出不同；两者的 682 行提交文件均通过格式校验。test 标签不在本地，预测一致率和格式通过率不能替代 accuracy。准确率应以 Kaggle 评估为准。
 
+## 从现有日志可额外读取的指标
+
+- **稳态吞吐与预热**：TP2 逐条请求 run 跳过前 3 条 warmup 后，679 条稳态请求的吞吐为 1.1925 req/s，P50/P95/P99 总请求耗时为 897.861 / 1010.179 / 1077.883 ms。全量最大值为 12.9999 s，对应 `test_0001`；日志没有把这条长尾归因到具体阶段，因此不直接称为 TTFT。
+- **阶段耗时拆分**：TP2 逐条请求的均值为 generation 836.320 ms、图像阶段 7.952 ms、其他 overhead 12.514 ms；记录的时间占比分别为 97.61%、0.93%、1.46%。这组 workload 的时间主要花在模型生成阶段。
+- **启动占比与残差**：模型加载占端到端总耗时，TP2 逐条、TP2-B32、DP2-B16 分别约为 12.27%、14.66%、28.95%。端到端耗时减去加载和已记录推理阶段后，仍有约 7.86 / 7.76 / 7.60 s 未进一步拆分；这是残差，不能归因到单一组件。
+- **完成率**：4 个 run 均为 PASS，682/682 条记录有效，failed、invalid、pending、prompt leakage 均为 0，每条 checkpoint 只尝试 1 次；4 份提交文件的结构校验也通过。它说明运行和格式完整，不代表 test accuracy。
+- **TTFT 覆盖**：TP2 逐条 run 的 `ttft_ms` 为 `count=0, reported_by_engine=false`；两个 batch run 没有 TTFT 字段。因此现有日志不能给出 TTFT 分位数，也没有 batch P95。
+- **worker telemetry 缺口**：TP2-B32 的 worker telemetry 因 RPC 返回 function 对象而序列化失败，`workers` 为空；DP2-B16 的 RPC 返回两个 replica 的运行后 used/free 快照，但 allocator `peak_allocated` / `peak_reserved` 为 0。后者不是峰值显存，不能用来填 Peak HBM。
+
 ## 显存快照
 
 下表是运行前后设备报告的空闲显存，单位 MiB。它用于观察本次运行前后系统余量变化，**不是 Peak HBM，也不是模型权重或 KV cache 的独立占用量**。
