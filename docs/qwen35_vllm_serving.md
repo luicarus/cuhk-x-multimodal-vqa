@@ -1,6 +1,6 @@
-# Qwen3.5-4B vLLM 双卡推理实验
+# Qwen3.5-4B baseline vLLM 双卡推理实验
 
-选择 Qwen3.5-4B 作为最终模型后，我在相同的 2×T4 环境中补充了 vLLM 推理实验，观察请求批处理、TP/DP 方式对吞吐、延迟和显存的影响。它是竞赛方案的推理工程延伸，不是独立 serving benchmark。
+选择 Qwen3.5-4B 作为最终模型后，我在 2×T4 配置中补充了 vLLM 推理实验，观察请求批处理、TP/DP 方式对吞吐、延迟和显存的影响。serving 对照使用 `Qwen/Qwen3.5-4B` base model，**不含 QLoRA adapter**；QLoRA adapter serving 尚未进行同口径测试。它是竞赛方案的推理工程延伸，不是独立 serving benchmark。
 
 ## 测试口径
 
@@ -12,18 +12,45 @@
 
 ## 配置与结果
 
-| Run | 执行方式 | 加载时间 | 推理阶段吞吐 | 延迟 | 端到端耗时 | 运行后空闲显存 |
-|---|---|---:|---:|---:|---:|---:|
-| `qwen35_4b_test` | Transformers，batch 1 | 7.58 s | 未单独记录 | 未记录 | 768.62 s（0.887 req/s） | 未记录 |
-| `qwen35_4b_test_vllm_v1` | vLLM TP=2，逐条请求 | 82.81 s | 1.1672 req/s | 均值 856.786 ms；P50 898.535；P95 1010.179；P99 1080.654 | 675.00 s（1.010 req/s） | GPU0/1：3.66 / 3.66 GiB |
-| `qwen35_4b_test_vllm_v2` | vLLM TP=2，`max_num_seqs=32` | 83.24 s | 1.4303 req/s；2.9927 output tokens/s | 摊销 699.156 ms / 请求 | 567.83 s（1.201 req/s） | GPU0/1：1.29 / 1.29 GiB |
-| `qwen35_4b_test_vllm_v3` | vLLM DP=2、TP=1，`max_num_seqs=16` | 182.53 s | 1.5490 req/s；3.2411 output tokens/s | 摊销 645.577 ms / 请求 | 630.41 s（1.082 req/s） | GPU0/1：3.14 / 3.03 GiB |
+| Run | 执行方式 | 推理吞吐 | 单请求延迟统计 | 批次摊销执行时间 | 加载 / 端到端总耗时 |
+|---|---|---:|---|---:|---:|
+| `qwen35_4b_test` | Transformers，batch 1 | 未单独记录 | 未记录 | — | 7.58 / 768.62 s |
+| `qwen35_4b_test_vllm_v1` | vLLM TP=2，逐条提交 | 1.1672 req/s | mean 856.786 ms；P50 898.535；P95 1010.179；P99 1080.654 | — | 82.81 / 675.00 s |
+| `qwen35_4b_test_vllm_v2` | vLLM TP=2，`max_num_seqs=32` | 1.4303 req/s | 未记录 | 699.156 ms / 请求 | 83.24 / 567.83 s |
+| `qwen35_4b_test_vllm_v3` | vLLM DP=2、TP=1，`max_num_seqs=16` | 1.5490 req/s | 未记录 | 645.577 ms / 请求 | 182.53 / 630.41 s |
 
-V2 由 22 个 batch 处理完 682 条请求，平均 batch 大小 31.0、平均 batch 时间 21.674 s；V3 使用 43 个 batch，平均 batch 大小 15.86、平均 batch 时间 10.239 s。这里的摊销耗时是批次执行时间除以该批请求数，不能当作单请求 P50/P95。两种批处理模式都没有保存可比较的 P95。
+TP2-B32 由 22 个 batch 处理完 682 条请求，平均 batch 大小 31.0、平均 batch 时间 21.674 s；DP2-B16 使用 43 个 batch，平均大小 15.86、平均 batch 时间 10.239 s。批次摊销执行时间是批次时长除以请求数，不是单请求 P50/P95，因此与 TP2 的请求延迟分栏记录。
+
+V2 和 V3 还记录了 output token rate（2.9927 / 3.2411 tokens/s），但输出上限为 8 tokens，实际答案通常只有 1–4 tokens，因此不把 decode token rate 当成主要 workload 指标；input/prompt tokens per second 没有记录。
 
 与 TP2-B32 相比，DP2-B16 的推理阶段吞吐提高 8.3%，摊销耗时降低 7.7%，推理总时间减少约 36.5 s。但它的模型加载多花约 99.3 s，因此 682 条请求的一次性端到端时间反而多 62.6 s。按双卡全程占用估算，含启动的 GPU 卡秒约为 TP2-B32 的 1665、DP2-B16 的 1849 / 千请求。DP 结束时每卡多保留约 1.75–1.85 GiB 空闲显存。
 
 DP2-B16 与 TP2-B32 有 675/682 条预测一致，7 条输出不同；两者的 682 行提交文件均通过格式校验。test 标签不在本地，预测一致率和格式通过率不能替代 accuracy。准确率应以 Kaggle 评估为准。
+
+## 显存快照
+
+下表是运行前后设备报告的空闲显存，单位 MiB。它用于观察本次运行前后系统余量变化，**不是 Peak HBM，也不是模型权重或 KV cache 的独立占用量**。
+
+| Run | 运行前空闲 GPU0 / GPU1 | 运行后空闲 GPU0 / GPU1 |
+|---|---:|---:|
+| TP2 逐条请求 | 3900.8 / 3900.8 | 3744.8 / 3744.8 |
+| TP2-B32 | 3710.8 / 3710.8 | 1316.8 / 1316.8 |
+| DP2-B16 | 4332.8 / 4332.8 | 3210.8 / 3104.8 |
+
+当前采集没有可靠的 worker-level Peak HBM、GPU 利用率或功耗。不同 Kaggle session 的初始显存也不完全相同，因此这里不把运行后快照解释成配置本身的峰值显存。
+
+## 并发口径
+
+V3 的运行合同记录 `data_parallel_size=2`、`tensor_parallel_size=1`、`max_num_seqs=16`，Runner 实际每批提交最多 16 条。现有运行结果没有单独记录每个 replica 的并发上限或 DP 的全局有效并发，因此这里只报告配置值和实际 batch 大小，不把 DP2-B16 换算成 global concurrency 32。
+
+## 下一步测量
+
+如果继续完善这组推理实验，优先补齐：
+
+1. 同一 workload 下的 1×T4 baseline，用它计算增加第二张 GPU 的 scaling efficiency。
+2. worker 级 Peak HBM/GPU，以及批处理下的 P50/P95/P99 E2E latency 和 TTFT。
+3. GPU utilization 与 input/prompt tokens per second；当前输出最多 8 tokens，output token rate 的解释力有限。
+4. 用同一协议测量 Qwen3.5-4B QLoRA adapter 的 serving 性能，与 base model 区分报告。
 
 ## 复现范围与限制
 
