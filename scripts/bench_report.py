@@ -214,9 +214,9 @@ def main() -> int:
     with_latency = [run for run in runs if run["latency"].get("requests")]
     with_batches = [run for run in runs if run["latency"].get("batched")]
     if with_batches:
-        # The batched view is the honest throughput mechanism: requests are
-        # interleaved by the scheduler, so per-request latency does not exist.
-        print("\nbatched execution (per-request latency not observable)")
+        # The batch is the honest end-to-end timing unit. Engine-reported TTFT
+        # remains available per request and is shown in its own section below.
+        print("\nbatched execution (per-request end-to-end latency not observable)")
         print(f"{'run':<34} {'batches':>8} {'N':>5} {'mean sz':>8} {'mean batch ms':>14} "
               f"{'amort ms/req':>13} {'req/s':>8} {'token/s':>9}")
         print("-" * 120)
@@ -259,41 +259,58 @@ def main() -> int:
                   f"{_fmt(share.get('generate_ms'), 10, 3)} "
                   f"{_fmt(share.get('overhead_ms'), 10, 3)}")
 
-        print("\ntime to first token (ms)")
-        print(f"{'run':<34} {'coverage':>9} {'p50':>9} {'p90':>9} {'p95':>9} {'p99':>9} "
-              f"{'token/s':>9}")
+    ttft_runs = [run for run in runs
+                 if run["latency"].get("requests") or run["latency"].get("batched")]
+    if ttft_runs:
+        print("\ntime to first token (vLLM request metric, ms)")
+        print(f"{'run':<34} {'coverage':>9} {'n':>6} {'p50':>9} {'p90':>9} "
+              f"{'p95':>9} {'p99':>9} {'token/s':>9}")
         print("-" * 120)
-        for run in with_latency:
-            ttft = run["latency"].get("steady_state_ttft_ms") or {}
-            if not ttft.get("reported_by_engine"):
-                print(f"{run['run_id']:<34} {'-':>9} engine does not report a first-token "
-                      f"timestamp (single blocking call)")
-                continue
+        for run in ttft_runs:
+            latency = run["latency"]
+            ttft = (latency.get("steady_state_ttft_ms") if latency.get("requests")
+                    else latency.get("ttft_ms")) or {}
+            token_rate = (latency.get("steady_state_token_rate") if latency.get("requests")
+                          else (latency.get("batch") or {}).get("token_rate"))
             print(f"{run['run_id']:<34} {_fmt(ttft.get('coverage'), 9)} "
-                  f"{_fmt(ttft.get('p50'), 9)} {_fmt(ttft.get('p90'), 9)} "
-                  f"{_fmt(ttft.get('p95'), 9)} {_fmt(ttft.get('p99'), 9)} "
-                  f"{_fmt(run['latency'].get('steady_state_token_rate'), 9)}")
+                  f"{ttft.get('count', 0):>6} {_fmt(ttft.get('p50'), 9)} "
+                  f"{_fmt(ttft.get('p90'), 9)} {_fmt(ttft.get('p95'), 9)} "
+                  f"{_fmt(ttft.get('p99'), 9)} {_fmt(token_rate, 9)}")
 
     memory_runs = [run for run in runs if (run.get("gpu_memory") or {}).get("after")]
     if memory_runs:
-        print("\ngpu memory per device (MiB), sampled from the parent process")
-        print(f"{'run':<34} {'dev':>4} {'name':<16} {'total':>9} {'used':>9} {'free':>9} "
-              f"{'alloc':>9} {'reserved':>9} {'peak_alloc':>11}")
+        print("\ngpu memory per device (MiB; device peak is NVML sampled during prediction)")
+        print(f"{'run':<34} {'dev':>4} {'name':<16} {'total':>9} {'used end':>9} "
+              f"{'free end':>9} {'sample peak':>12} {'min free':>10} {'torch peak':>11}")
         print("-" * 120)
         for run in memory_runs:
             memory = run["gpu_memory"]
+            peaks = memory.get("peaks") or {}
+            polling = peaks.get("device_polling") or {}
+            sampled_devices = polling.get("devices") or {}
+            torch_peaks = peaks.get("torch_allocator")
+            if torch_peaks is None:
+                # Backward compatibility with summaries written before NVML polling.
+                torch_peaks = peaks
             for device, values in sorted(memory["after"].items()):
-                peak = (memory.get("peaks") or {}).get(device, {})
+                sampled = sampled_devices.get(device, {})
+                peak = torch_peaks.get(device, {})
                 print(f"{run['run_id']:<34} {device:>4} {values.get('name', '?')[:16]:<16} "
-                      f"{_fmt(values.get('total_mib'), 9, 1)} {_fmt(values.get('used_mib'), 9, 1)} "
-                      f"{_fmt(values.get('free_mib'), 9, 1)} {_fmt(values.get('allocated_mib'), 9, 1)} "
-                      f"{_fmt(values.get('reserved_mib'), 9, 1)} "
-                      f"{_fmt(peak.get('peak_allocated_mib'), 11, 1)}")
+                  f"{_fmt(values.get('total_mib'), 9, 1)} {_fmt(values.get('used_mib'), 9, 1)} "
+                  f"{_fmt(values.get('free_mib'), 9, 1)} "
+                  f"{_fmt(sampled.get('sampled_peak_used_mib'), 12, 1)} "
+                  f"{_fmt(sampled.get('sampled_min_free_mib'), 10, 1)} "
+                  f"{_fmt(peak.get('peak_allocated_mib'), 11, 1)}")
             before = memory.get("before") or {}
             if before:
                 deltas = [f"dev{d}: {before[d]['used_mib']:.0f}->{memory['after'][d]['used_mib']:.0f} MiB"
                           for d in sorted(before) if d in memory["after"]]
                 print(f"{'':<34} growth during run: {'; '.join(deltas)}")
+            if polling:
+                print(f"{'':<34} NVML {polling.get('scope', '?')}: "
+                      f"{polling.get('sample_count', 0)} samples at "
+                      f"{polling.get('interval_ms', '?')} ms interval; "
+                      f"available={polling.get('available', False)}")
 
     worker_runs = [run for run in runs
                    if ((run.get("backend_metadata") or {}).get("workers") or {}).get("workers")]

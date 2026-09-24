@@ -120,6 +120,23 @@ def test_request_metrics_handles_a_backend_without_engine_timing():
     assert metrics["e2e_ms"] == 500.0
 
 
+def test_request_metrics_batch_preserves_each_reported_ttft_and_missing_values():
+    from cuhkx.inference.profiling import request_metrics_batch
+
+    class Reporting:
+        last_metrics = {"request_metrics": [
+            {"reported": True, "first_token_latency": 0.025},
+            {"reported": False, "first_token_latency": None},
+            {"reported": True, "num_generation_tokens": 2},
+        ]}
+
+    assert request_metrics_batch(Reporting(), 3) == [
+        {"ttft_ms": 25.0}, {"ttft_ms": None}, {"ttft_ms": None},
+    ]
+    # A mismatched engine response is missing telemetry, not a failed run.
+    assert request_metrics_batch(Reporting(), 2) == [{"ttft_ms": None}] * 2
+
+
 def test_memory_sampling_degrades_without_cuda():
     """Profiling must never be the reason a prediction run fails."""
     from cuhkx.inference.profiling import gpu_memory_peak_snapshot, sample_gpu_memory
@@ -134,6 +151,39 @@ def test_memory_sampling_degrades_without_cuda():
                 raise RuntimeError("no driver")
 
     assert sample_gpu_memory(BrokenCuda()) == {}
+
+
+def test_sampled_gpu_memory_peak_tracks_high_water_and_low_free_memory():
+    from cuhkx.inference.profiling import GpuMemoryPeakMonitor
+
+    monitor = GpuMemoryPeakMonitor(interval_ms=100, scope="test")
+    monitor.observe({"0": {"name": "Tesla T4", "total_mib": 15000,
+                           "used_mib": 11000, "free_mib": 4000}})
+    monitor.observe({"0": {"name": "Tesla T4", "total_mib": 15000,
+                           "used_mib": 13200, "free_mib": 1800}})
+    monitor.observe({"0": {"name": "Tesla T4", "total_mib": 15000,
+                           "used_mib": 12500, "free_mib": 2500}})
+
+    result = monitor.stop()
+    assert result["source"] == "nvml_device_memory_poll"
+    assert result["available"] is True
+    assert result["scope"] == "test"
+    assert result["interval_ms"] == 100
+    assert result["sample_count"] == 3
+    assert result["devices"]["0"]["sampled_peak_used_mib"] == 13200.0
+    assert result["devices"]["0"]["sampled_min_free_mib"] == 1800.0
+    assert result["devices"]["0"]["last_used_mib"] == 12500.0
+
+
+def test_gpu_memory_peak_monitor_is_optional_without_nvml(monkeypatch):
+    import sys
+    from cuhkx.inference.profiling import GpuMemoryPeakMonitor
+
+    monkeypatch.setitem(sys.modules, "pynvml", None)
+    result = GpuMemoryPeakMonitor(interval_ms=100).start().stop()
+    assert result["available"] is False
+    assert result["sample_count"] == 0
+    assert "pynvml" in result["error"]
 
 
 def test_memory_snapshot_reports_each_device():
@@ -192,7 +242,8 @@ def test_summary_latency_is_not_part_of_the_verified_contract():
 
 def _write_run(root: Path, run_id: str, *, elapsed: float, load: float, resumed: int,
                rows: list[tuple[str, str]], latency: dict | None = None,
-               engine: str = "vllm", dataset: str = "pilot") -> None:
+               gpu_memory: dict | None = None, engine: str = "vllm",
+               dataset: str = "pilot") -> None:
     directory = root / run_id
     directory.mkdir(parents=True)
     backend = {"backend": "test_backend", "load_seconds": load, "versions": {}}
@@ -203,6 +254,8 @@ def _write_run(root: Path, run_id: str, *, elapsed: float, load: float, resumed:
     }
     if latency is not None:
         summary["latency"] = latency
+    if gpu_memory is not None:
+        summary["gpu_memory"] = gpu_memory
     (directory / "run_summary.json").write_text(json.dumps(summary), encoding="utf-8")
     # Engine identity lives in the signed contract, not in the summary.
     (directory / "resume_state.json").write_text(
@@ -362,6 +415,9 @@ def test_report_shows_the_batched_view(tmp_path):
                   "total_ms": 900.0, "mean_batch_ms": 900.0, "mean_batch_size": 3.0,
                   "throughput_rps": 3.3333, "token_rate": 3.3333,
                   "amortized_ms_per_request": 300.0},
+        "ttft_ms": {"count": 2, "requests": 3, "coverage": 0.6667,
+                    "reported_by_engine": True, "p50": 60.0, "p90": 80.0,
+                    "p95": 80.0, "p99": 80.0},
     }
     _write_run(tmp_path, "batched", elapsed=1.0, load=0.0, resumed=0, rows=rows,
                latency=latency)
@@ -370,6 +426,29 @@ def test_report_shows_the_batched_view(tmp_path):
     assert result.returncode == 0, result.stderr
     assert "batched execution" in result.stdout
     assert "300.000" in result.stdout
+    assert "time to first token" in result.stdout
+    assert "60.000" in result.stdout
+
+
+def test_report_shows_nvml_sampled_gpu_memory_peaks(tmp_path):
+    gpu_memory = {
+        "after": {"0": {"name": "Tesla T4", "total_mib": 15000.0,
+                         "used_mib": 12000.0, "free_mib": 3000.0}},
+        "peaks": {"device_polling": {
+            "available": True, "scope": "prediction_after_model_load",
+            "interval_ms": 100, "sample_count": 12,
+            "devices": {"0": {"sampled_peak_used_mib": 13500.0,
+                               "sampled_min_free_mib": 1500.0}},
+        }},
+    }
+    _write_run(tmp_path, "nvml", elapsed=1.0, load=0.0, resumed=0,
+               rows=[("p1", "A")], gpu_memory=gpu_memory)
+
+    result = _report(tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert "sample peak" in result.stdout
+    assert "13500.0" in result.stdout
+    assert "100 ms interval" in result.stdout
 
 
 def test_timer_batch_view_amortizes_over_the_whole_run():
@@ -390,3 +469,30 @@ def test_timer_batch_view_amortizes_over_the_whole_run():
     assert view["mean_batch_size"] == 6.0
     with pytest.raises(ValueError):
         timer.record_batch(batch_ms=1.0, image_ms=0.0, generate_ms=0.0, size=0)
+
+
+def test_batched_ttft_summary_uses_per_request_engine_samples_and_reports_coverage():
+    timer = RequestTimer()
+    timer.record_batch(
+        batch_ms=300.0, image_ms=0.0, generate_ms=250.0, size=3,
+        request_ttft=[
+            {"qa_id": "q1", "ttft_ms": 40.0},
+            {"qa_id": "q2", "ttft_ms": 80.0},
+            {"qa_id": "q3", "ttft_ms": None},
+        ],
+    )
+
+    ttft = timer.summary()["ttft_ms"]
+    assert ttft["reported_by_engine"] is True
+    assert ttft["requests"] == 3
+    assert ttft["count"] == 2
+    assert ttft["coverage"] == 0.6667
+    assert ttft["mean_ms"] == 60.0
+    assert ttft["p50"] == 40.0
+    assert ttft["p95"] == 80.0
+    assert ttft["p99"] == 80.0
+    assert ttft["samples"] == [
+        {"qa_id": "q1", "ttft_ms": 40.0},
+        {"qa_id": "q2", "ttft_ms": 80.0},
+        {"qa_id": "q3", "ttft_ms": None},
+    ]

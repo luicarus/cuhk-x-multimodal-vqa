@@ -202,6 +202,35 @@ def test_batched_runner_records_batch_view(project):
     assert latency["requests"] == 0
 
 
+def test_batched_runner_records_engine_ttft_for_each_qa(project):
+    config, source = setup_run(project)
+
+    class TTFTBatchBackend(BatchBackend):
+        def generate_batch(self, batch, *, max_new_tokens):
+            answers = super().generate_batch(batch, max_new_tokens=max_new_tokens)
+            self.last_metrics = {
+                "reported": True,
+                "request_metrics": [
+                    {"reported": True, "first_token_latency": 0.020},
+                    {"reported": True, "first_token_latency": 0.040},
+                ],
+            }
+            return answers
+
+    result = run(config, source, TTFTBatchBackend([]), engine="vllm",
+                 engine_options={"max_num_seqs": 2})
+
+    ttft = result["latency"]["ttft_ms"]
+    assert ttft["requests"] == 2
+    assert ttft["count"] == 2
+    assert ttft["coverage"] == 1.0
+    assert ttft["mean_ms"] == 30.0
+    assert ttft["p50"] == 20.0
+    assert ttft["p95"] == 40.0
+    assert [item["qa_id"] for item in ttft["samples"]] == result["target_ids"]
+    assert [item["ttft_ms"] for item in ttft["samples"]] == [20.0, 40.0]
+
+
 def test_batched_runner_chunks_oversized_batches(project):
     config, source = setup_run(project)
     backend = BatchBackend([])

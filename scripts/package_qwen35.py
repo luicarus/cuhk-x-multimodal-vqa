@@ -73,6 +73,8 @@ def collect(project: Path) -> dict[str, bytes]:
         "Test inference runs on vLLM 0.19.1 with data parallel replicas across both\n"
         "Kaggle T4 GPUs. This package is inference-only: it contains no training\n"
         "stack and no model weights.\n"
+        "The run summary records per-request engine TTFT and NVML-sampled device\n"
+        "memory peaks during prediction when the driver telemetry is available.\n"
         "The Qwen2.5-VL-7B baseline package and results are not included or modified.\n"
     ).encode("utf-8")
     source_manifest = json.loads((project / "data/asset_manifest.json").read_text(encoding="utf-8"))

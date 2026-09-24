@@ -23,7 +23,10 @@ distribution shows the cold-start tail that a user actually experiences.
 """
 from __future__ import annotations
 
+import math
 import statistics
+import threading
+import time
 
 from cuhkx.config import require
 
@@ -132,6 +135,34 @@ def request_metrics(backend):
     }
 
 
+def request_metrics_batch(backend, expected_requests):
+    """Return per-request TTFT values for the last batched engine call.
+
+    vLLM returns one ``RequestOutput.metrics`` object per prompt. The batch
+    backend preserves those objects as plain dictionaries in
+    ``last_metrics.request_metrics``; missing or malformed metrics remain
+    absent and never fail inference.
+    """
+    require(expected_requests >= 0, "expected request count cannot be negative")
+    missing = [{"ttft_ms": None} for _ in range(expected_requests)]
+    values = getattr(backend, "last_metrics", None)
+    if not isinstance(values, dict):
+        return missing
+    per_request = values.get("request_metrics")
+    if not isinstance(per_request, list) or len(per_request) != expected_requests:
+        return missing
+    result = []
+    for metrics in per_request:
+        ttft = (metrics.get("first_token_latency")
+                if isinstance(metrics, dict) and metrics.get("reported") else None)
+        if (not isinstance(ttft, (int, float)) or isinstance(ttft, bool)
+                or not math.isfinite(float(ttft)) or ttft < 0):
+            result.append({"ttft_ms": None})
+        else:
+            result.append({"ttft_ms": float(ttft) * 1000.0})
+    return result
+
+
 def sample_gpu_memory(torch_module):
     """Memory snapshot that degrades to an empty dict instead of failing a run."""
     if torch_module is None:
@@ -151,6 +182,127 @@ def gpu_memory_peak_snapshot(torch_module):
         return gpu_memory_peaks(torch_module)
     except Exception:
         return {}
+
+
+class GpuMemoryPeakMonitor:
+    """Poll device-wide NVML memory and retain a sampled high-water mark.
+
+    The parent runner cannot see vLLM's CUDA allocator peaks when engines live
+    in child processes. NVML reports total device use across processes, so this
+    monitor samples each visible physical GPU while prediction is running. It
+    is best-effort: driver/library failures are returned as metadata and never
+    fail inference.
+    """
+
+    def __init__(self, *, interval_ms=100, scope="prediction_after_model_load"):
+        require(interval_ms >= 10, "GPU memory polling interval must be at least 10 ms")
+        self.interval_ms = int(interval_ms)
+        self.scope = scope
+        self.sample_count = 0
+        self.devices = {}
+        self.error = None
+        self._nvml = None
+        self._handles = {}
+        self._stop = threading.Event()
+        self._thread = None
+        self._initialized = False
+
+    def start(self):
+        try:
+            import pynvml
+
+            self._nvml = pynvml
+            pynvml.nvmlInit()
+            self._initialized = True
+            for index in range(pynvml.nvmlDeviceGetCount()):
+                self._handles[str(index)] = pynvml.nvmlDeviceGetHandleByIndex(index)
+            if not self._handles:
+                raise RuntimeError("NVML reported no visible GPU devices")
+            self._sample_once()
+            self._thread = threading.Thread(
+                target=self._poll, name="cuhkx-gpu-memory-monitor", daemon=True)
+            self._thread.start()
+        except Exception as error:  # noqa: BLE001 - telemetry must not block inference
+            self.error = f"{type(error).__name__}: {error}"
+            self._shutdown_nvml()
+        return self
+
+    def _read_devices(self):
+        readings = {}
+        for index, handle in self._handles.items():
+            memory = self._nvml.nvmlDeviceGetMemoryInfo(handle)
+            name = self._nvml.nvmlDeviceGetName(handle)
+            if isinstance(name, bytes):
+                name = name.decode("utf-8", errors="replace")
+            readings[index] = {
+                "name": str(name),
+                "total_mib": memory.total / 1024**2,
+                "used_mib": memory.used / 1024**2,
+                "free_mib": memory.free / 1024**2,
+            }
+        return readings
+
+    def observe(self, readings):
+        """Add one set of device readings; public for deterministic CPU tests."""
+        self.sample_count += 1
+        for index, reading in readings.items():
+            current = self.devices.get(index)
+            used = float(reading["used_mib"])
+            free = float(reading["free_mib"])
+            if current is None:
+                self.devices[index] = {
+                    "name": reading.get("name", "?"),
+                    "total_mib": round(float(reading["total_mib"]), 1),
+                    "first_used_mib": round(used, 1),
+                    "last_used_mib": round(used, 1),
+                    "sampled_peak_used_mib": round(used, 1),
+                    "sampled_min_free_mib": round(free, 1),
+                }
+            else:
+                current["last_used_mib"] = round(used, 1)
+                current["sampled_peak_used_mib"] = round(
+                    max(current["sampled_peak_used_mib"], used), 1)
+                current["sampled_min_free_mib"] = round(
+                    min(current["sampled_min_free_mib"], free), 1)
+
+    def _sample_once(self):
+        try:
+            self.observe(self._read_devices())
+        except Exception as error:  # noqa: BLE001 - telemetry must not block inference
+            if self.error is None:
+                self.error = f"{type(error).__name__}: {error}"
+            self._stop.set()
+
+    def _poll(self):
+        interval = self.interval_ms / 1000.0
+        while not self._stop.wait(interval):
+            self._sample_once()
+
+    def _shutdown_nvml(self):
+        if self._initialized:
+            try:
+                self._nvml.nvmlShutdown()
+            except Exception:  # noqa: BLE001 - teardown is best-effort
+                pass
+            self._initialized = False
+
+    def stop(self):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=max(1.0, self.interval_ms / 1000.0 * 4))
+            self._thread = None
+        if self._initialized:
+            self._sample_once()
+        self._shutdown_nvml()
+        return {
+            "source": "nvml_device_memory_poll",
+            "available": self.sample_count > 0,
+            "scope": self.scope,
+            "interval_ms": self.interval_ms,
+            "sample_count": self.sample_count,
+            "devices": self.devices,
+            "error": self.error,
+        }
 
 
 class RequestTimer:
@@ -180,17 +332,31 @@ class RequestTimer:
         })
 
     def record_batch(self, *, batch_ms, image_ms, generate_ms, size,
-                     ttft_ms=None, generation_tokens=0):
+                     ttft_ms=None, generation_tokens=0, request_ttft=None):
         """One timing sample for a whole submitted batch.
 
-        Per-request latency is not derivable from a batched call: the engine
-        interleaves the requests, so each finished answer does not own a
-        measurable slice of the wall clock. Reporting fabricated per-request
-        numbers would be worse than reporting the batch, so the batch is the
-        sample and throughput comes from size over batch time.
+        Per-request end-to-end latency is not derivable from a batched call: the
+        engine interleaves requests, so each answer does not own a measurable
+        slice of the wall clock. vLLM's engine-reported TTFT is retained per
+        request separately; batch throughput still comes from size over batch
+        wall time.
         """
         require(batch_ms >= 0 and image_ms >= 0 and generate_ms >= 0, "negative duration")
         require(size >= 1, "an empty batch has no timing")
+        if request_ttft is None:
+            request_ttft = [{"qa_id": None, "ttft_ms": None} for _ in range(size)]
+        require(len(request_ttft) == size, "request TTFT count must match batch size")
+        normalized_ttft = []
+        for item in request_ttft:
+            require(isinstance(item, dict), "request TTFT entries must be mappings")
+            value = item.get("ttft_ms")
+            require(value is None or (isinstance(value, (int, float))
+                    and not isinstance(value, bool) and math.isfinite(value) and value >= 0),
+                    "invalid time to first token")
+            normalized_ttft.append({
+                "qa_id": item.get("qa_id"),
+                "ttft_ms": None if value is None else round(float(value), 3),
+            })
         self.batches.append({
             "size": size,
             "batch_ms": round(batch_ms, 3),
@@ -199,6 +365,7 @@ class RequestTimer:
             "overhead_ms": round(max(0.0, batch_ms - image_ms - generate_ms), 3),
             "ttft_ms": None if ttft_ms is None else round(ttft_ms, 3),
             "generation_tokens": generation_tokens,
+            "request_ttft": normalized_ttft,
         })
 
     def _batch_view(self):
@@ -220,6 +387,16 @@ class RequestTimer:
             # sequential runner's s/req; it is not a latency measurement.
             "amortized_ms_per_request": round(total_ms / requests, 3) if requests else None,
         }
+
+    def _batch_ttft(self):
+        samples = [sample for batch in self.batches for sample in batch["request_ttft"]]
+        observed = [sample["ttft_ms"] for sample in samples if sample["ttft_ms"] is not None]
+        coverage = round(len(observed) / len(samples), 4) if samples else 0.0
+        if not observed:
+            return {"count": 0, "requests": len(samples), "coverage": coverage,
+                    "reported_by_engine": False, "samples": samples}
+        return {**_describe(observed), "requests": len(samples), "coverage": coverage,
+                "reported_by_engine": True, "samples": samples}
 
     def _phase(self, name, samples):
         if not samples:
@@ -261,9 +438,9 @@ class RequestTimer:
             return {"requests": 0, "warmup_skipped": 0}
         if not self.samples:
             # Batched run: per-request timing is not observable, so the summary
-            # is the batch view plus the memory/consistency evidence.
+            # stays batch-level except for vLLM's independently reported TTFT.
             return {"requests": 0, "warmup_skipped": 0, "batched": True,
-                    "batch": batch_view}
+                    "batch": batch_view, "ttft_ms": self._batch_ttft()}
         warm = self.samples[self.warmup:]
         # A resumed run may legitimately finish in fewer requests than the warmup
         # window; fall back to the full set rather than reporting nothing.

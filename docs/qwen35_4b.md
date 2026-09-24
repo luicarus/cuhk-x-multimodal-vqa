@@ -42,11 +42,15 @@ qwen35_repo/
 默认先运行 test 前 16 QA smoke，再以 Runner batch 32 运行完整 682 QA；smoke 的实际批次受 16 条限额约束：
 
 ```bash
-cuhkx predict --profile qwen35 --backend vllm --tensor-parallel-size 1 --data-parallel-size 2 --max-num-seqs 16 --runner-batch-size 32 --dataset test --limit 16 --run-id qwen35_4b_smoke_dp2_b32 --weights-dir <weights> --resume
-cuhkx predict --profile qwen35 --backend vllm --tensor-parallel-size 1 --data-parallel-size 2 --max-num-seqs 16 --runner-batch-size 32 --dataset test --run-id qwen35_4b_test_dp2_b32 --weights-dir <weights> --resume
-cuhkx verify-run --profile qwen35 --run-id qwen35_4b_test_dp2_b32
-cuhkx submit --profile qwen35 --run-id qwen35_4b_test_dp2_b32
+cuhkx predict --profile qwen35 --backend vllm --tensor-parallel-size 1 --data-parallel-size 2 --max-num-seqs 16 --runner-batch-size 32 --dataset test --limit 16 --run-id qwen35_4b_smoke_dp2_b32_ttft --weights-dir <weights> --resume
+cuhkx predict --profile qwen35 --backend vllm --tensor-parallel-size 1 --data-parallel-size 2 --max-num-seqs 16 --runner-batch-size 32 --dataset test --run-id qwen35_4b_test_dp2_b32_ttft --weights-dir <weights> --resume
+cuhkx verify-run --profile qwen35 --run-id qwen35_4b_test_dp2_b32_ttft
+cuhkx submit --profile qwen35 --run-id qwen35_4b_test_dp2_b32_ttft
 ```
+
+Each new batched run records vLLM's per-request `first_token_latency` under `run_summary.json` as `latency.ttft_ms`, including sample count, coverage, mean, P50/P90/P95/P99, and QA-aligned samples. TTFT is measured by vLLM from request arrival and includes scheduler queue time; batch end-to-end latency remains a separate metric. The `_ttft` run-id suffix forces fresh measurements instead of resuming an earlier B32 result without TTFT samples.
+
+The runner also polls NVML every 100 ms during prediction. `gpu_memory.peaks.device_polling` reports the per-device sampled peak used memory and minimum free memory across all processes, including the vLLM replicas. This is a device-wide sampled high-water mark, not a per-process allocator peak; brief spikes between samples may be missed. If NVML is unavailable, the run continues and records the monitor as unavailable.
 
 测试集没有公开答案时，`submit` 只能检查 CSV 完整性，不能计算本地 accuracy。最终对比以相同比赛评估口径/公开榜分数为准。若需要本地 sanity，可把 `--dataset pilot` 作为额外运行，但它不替代 test。
 

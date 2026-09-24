@@ -414,9 +414,9 @@ class Qwen35VLLMBackend:
 
         ``batch`` is a list of ``(images, prompt, allowed_outputs)`` triples. The
         engine interleaves them, so this returns answers in input order without
-        any per-request timing: the batch is the smallest honest unit here, which
-        is why the runner records a batch sample rather than fabricating one per
-        request.
+        per-request end-to-end wall times. When vLLM reports first-token timing,
+        those TTFT samples remain attached to their corresponding requests; the
+        batch remains the unit for throughput accounting.
 
         ``max_num_seqs`` bounds how many the scheduler actually runs at once; the
         engine handles the excess by queuing, so an oversized batch degrades to
@@ -499,6 +499,7 @@ class Qwen35VLLMBackend:
             reported = [value for value in metrics if value.get("reported")]
             self.last_metrics = {
                 "reported": bool(reported),
+                "request_metrics": metrics,
                 "first_token_latency_max": max((float(v.get("first_token_latency", 0.0))
                                                 for v in reported), default=None),
                 "first_token_latency_mean": (sum(float(v.get("first_token_latency", 0.0))
@@ -532,6 +533,7 @@ class Qwen35VLLMBackend:
         reported = [value for value in metrics if value.get("reported")]
         self.last_metrics = {
             "reported": bool(reported),
+            "request_metrics": metrics,
             "first_token_latency_max": max((float(v.get("first_token_latency", 0.0))
                                             for v in reported), default=None),
             "first_token_latency_mean": (sum(float(v.get("first_token_latency", 0.0))

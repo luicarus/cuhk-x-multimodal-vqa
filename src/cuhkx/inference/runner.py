@@ -14,8 +14,10 @@ from cuhkx.config import inside, require
 from cuhkx.data.inputs import load_qa, pending_targets, select_targets
 from cuhkx.data.validate import check_inputs, fingerprint, sha256
 from cuhkx.evaluation.metric import available_option_letters
-from cuhkx.inference.profiling import (RequestTimer, gpu_memory_peak_snapshot,
-                                       request_metrics, sample_gpu_memory)
+from cuhkx.inference.profiling import (GpuMemoryPeakMonitor, RequestTimer,
+                                       gpu_memory_peak_snapshot,
+                                       request_metrics, request_metrics_batch,
+                                       sample_gpu_memory)
 from cuhkx.inference.prompt import (PROMPT_VERSION, allowed_answer_outputs, build_mcq_prompt,
                                     detect_prompt_leakage, parse_model_answer)
 from cuhkx.inference.storage import atomic_write, run_lock, write_json
@@ -288,6 +290,7 @@ def run_predictions(config, dataset, limit, run_id, model_source, backend_factor
         memory_before = None
         memory_after = None
         memory_peaks = {}
+        memory_peak_monitor = None
         if pending:
             memory_before = sample_gpu_memory(profiling_torch())
         options = engine_options or {}
@@ -302,6 +305,8 @@ def run_predictions(config, dataset, limit, run_id, model_source, backend_factor
             # than one request at a time; the engine setting selects the path.
             require(hasattr(backend, "generate_batch"),
                     f"engine {engine} does not support batched submission")
+        if pending:
+            memory_peak_monitor = GpuMemoryPeakMonitor().start()
         for start in range(0, len(pending), batch_size):
             batch = pending[start:start + batch_size]
             if batch_size == 1:
@@ -332,6 +337,7 @@ def run_predictions(config, dataset, limit, run_id, model_source, backend_factor
                     triples, max_new_tokens=config["baseline"]["generation"]["max_new_tokens"])
                 batch_ms = (time.perf_counter() - image_started) * 1000.0
                 metrics = request_metrics(backend)
+                per_request_metrics = request_metrics_batch(backend, len(batch))
                 for qa, images, raw in zip(batch, batch_images, raws, strict=True):
                     qa_id = qa["qa_id"]
                     # Per-request state must reset inside the loop: a variable set
@@ -378,6 +384,10 @@ def run_predictions(config, dataset, limit, run_id, model_source, backend_factor
                 size=len(batch),
                 ttft_ms=metrics.get("ttft_ms"),
                 generation_tokens=metrics.get("generation_tokens") or 0,
+                request_ttft=[
+                    {"qa_id": qa["qa_id"], "ttft_ms": per_request_metrics[index]["ttft_ms"]}
+                    for index, qa in enumerate(batch)
+                ],
             )
             if fail_fast and any(records[q["qa_id"]]["status"] != "valid" for q in batch):
                 break
@@ -386,10 +396,13 @@ def run_predictions(config, dataset, limit, run_id, model_source, backend_factor
         atomic_write(output / "predictions.csv", _predictions(ordered))
         atomic_write(output / "audit.jsonl", _jsonl(ordered))
         if pending:
-            # Sampled while the engine is still resident: this is the figure that
-            # decides whether a larger batch fits.
+            # Record the end snapshot, PyTorch allocator counters, and the
+            # device-wide NVML high-water mark sampled throughout prediction.
             memory_after = sample_gpu_memory(profiling_torch())
-            memory_peaks = gpu_memory_peak_snapshot(profiling_torch())
+            memory_peaks = {
+                "torch_allocator": gpu_memory_peak_snapshot(profiling_torch()),
+                "device_polling": memory_peak_monitor.stop() if memory_peak_monitor else {},
+            }
         counts = {status: sum(row["status"] == status for row in ordered) for status in ("valid", "invalid", "failed")}
         counts.update(pending=len(targets) - len(ordered), prompt_leakage=0)
         summary = {"status": "PASS" if counts["valid"] == len(targets) else "FAIL",

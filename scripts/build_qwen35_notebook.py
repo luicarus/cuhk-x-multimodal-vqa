@@ -61,7 +61,9 @@ ATTENTION_BACKEND = "TRITON_ATTN"
 # 后端并行拆成每个 replica 16 条。TP2 时每个 engine 和 Runner batch 都是 32.
 MAX_NUM_SEQS = 16 if PARALLEL_MODE == "dp" else 32
 RUNNER_BATCH_SIZE = 32
-RUN_TAG = (f"dp{DATA_PARALLEL}" if PARALLEL_MODE == "dp" else f"tp{TENSOR_PARALLEL}") + f"_b{RUNNER_BATCH_SIZE}"
+# A fresh run-id prevents the earlier B32 result (which had no per-request
+# TTFT samples) from being accepted as already complete on resume.
+RUN_TAG = (f"dp{DATA_PARALLEL}" if PARALLEL_MODE == "dp" else f"tp{TENSOR_PARALLEL}") + f"_b{RUNNER_BATCH_SIZE}_ttft"
 SMOKE_RUN_ID = f"qwen35_4b_smoke_{RUN_TAG}"
 TEST_RUN_ID = f"qwen35_4b_test_{RUN_TAG}"
 '''),
@@ -253,6 +255,11 @@ else:
     print("engine metrics field inventory:",
           json.dumps(backend_metadata.get("metrics_shape"), indent=2, default=str))
 print(json.dumps({"backend": backend_metadata, "prefix_cache": prefix}, indent=2))
+ttft_summary = smoke.get("latency", {}).get("ttft_ms", {})
+print("per-request engine TTFT summary (ms):",
+      json.dumps({key: value for key, value in ttft_summary.items() if key != "samples"}, indent=2))
+print("sampled device memory peak (MiB):",
+      json.dumps(smoke.get("gpu_memory", {}).get("peaks", {}).get("device_polling", {}), indent=2))
 '''),
     cell("markdown", "## 5. 完整 test：682 QA 与提交文件（vLLM）"),
     cell("code", '''
@@ -262,6 +269,12 @@ cloud("verify-run", "--profile", "qwen35", "--run-id", TEST_RUN_ID)
 cloud("submit", "--profile", "qwen35", "--run-id", TEST_RUN_ID)
 print("Qwen3.5 submission:", REPO / "outputs" / TEST_RUN_ID / "submission.csv")
 print("Qwen3.5 run evidence:", REPO / "outputs" / TEST_RUN_ID)
+test_summary = json.loads((REPO / "outputs" / TEST_RUN_ID / "run_summary.json").read_text())
+ttft_summary = test_summary.get("latency", {}).get("ttft_ms", {})
+print("per-request engine TTFT summary (ms):",
+      json.dumps({key: value for key, value in ttft_summary.items() if key != "samples"}, indent=2))
+print("sampled device memory peak (MiB):",
+      json.dumps(test_summary.get("gpu_memory", {}).get("peaks", {}).get("device_polling", {}), indent=2))
 '''),
 ]
 

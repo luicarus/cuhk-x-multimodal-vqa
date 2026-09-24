@@ -31,7 +31,7 @@
 - **阶段耗时拆分**：TP2 逐条请求的均值为 generation 836.320 ms、图像阶段 7.952 ms、其他 overhead 12.514 ms；记录的时间占比分别为 97.61%、0.93%、1.46%。这组 workload 的时间主要花在模型生成阶段。
 - **启动占比与残差**：模型加载占端到端总耗时，TP2 逐条、TP2-B32、当前 DP2-B32 分别约为 12.27%、14.66%、17.36%。端到端耗时减去加载和已记录推理阶段后，仍有约 7.86 / 7.76 / 7.99 s 未进一步拆分；这是残差，不能归因到单一组件。
 - **完成率**：4 个 run 均为 PASS，682/682 条记录有效，failed、invalid、pending、prompt leakage 均为 0，每条 checkpoint 只尝试 1 次；4 份提交文件的结构校验也通过。它说明运行和格式完整，不代表 test accuracy。
-- **TTFT 覆盖**：TP2 逐条 run 的 `ttft_ms` 为 `count=0, reported_by_engine=false`；当前 DP2-B32 的 `latency.requests=0`，没有逐请求 TTFT 样本。因此现有日志不能给出当前 batch run 的 TTFT 或请求延迟分布。
+- **TTFT 覆盖**：此前 TP2 逐条 run 的 `ttft_ms` 为 `count=0, reported_by_engine=false`；当前 DP2-B32 结果也由旧版包生成，`latency.requests=0` 且没有逐请求 TTFT 样本。新打包的 Notebook 会用 `_ttft` run-id 重新运行，并从 vLLM 的每请求 `first_token_latency` 写入覆盖率与分位数；批次端到端延迟仍单独统计。
 - **worker telemetry 缺口**：TP2-B32 的 worker telemetry 因 RPC 返回 function 对象而序列化失败，`workers` 为空；当前 DP2-B32 的 worker telemetry 可读到两个 replica，但 allocator `peak_allocated` / `peak_reserved` 为 0。这些日志没有 Peak HBM，不能把运行结束读数标成峰值。
 
 ## 显存观测
@@ -45,7 +45,7 @@
 | DP2-B16（历史） | 4332.8 / 4332.8 | 3210.8 / 3104.8 |
 | **DP2-B32（当前）** | **4332.8 / 4332.8** | **2268.8 / 2268.8** |
 
-当前 DP2-B32 结束时每卡还报告约 2.22 GiB 空闲显存。worker allocator 的 `peak_allocated_mib` / `peak_reserved_mib` 仍为 0，因此没有可用的 Peak HBM；不同 Kaggle session 的后台占用也会影响空闲量。
+当前 DP2-B32 结束时每卡还报告约 2.22 GiB 空闲显存。worker allocator 的 `peak_allocated_mib` / `peak_reserved_mib` 仍为 0，因此这份旧运行没有可用峰值读数。新 ZIP 会在预测期间每 100 ms 用 NVML 采样每卡全设备 used/free 高水位，保存在 `gpu_memory.peaks.device_polling`；这是设备级采样峰值，包含其他进程占用，采样间隔之间的瞬时尖峰可能漏掉。不同 Kaggle session 的后台占用也会影响结果。
 
 ## 并发口径
 
@@ -57,16 +57,16 @@
 
 如果继续完善这组推理实验，优先补齐：
 
-1. 同一 workload 下的 1×T4 baseline，用它计算增加第二张 GPU 的 scaling efficiency。
-2. worker 级 Peak HBM/GPU，以及批处理下的 P50/P95/P99 E2E latency 和 TTFT。
-3. GPU utilization 与 input/prompt tokens per second；当前输出最多 8 tokens，output token rate 的解释力有限。
+1. 用更新后的 test ZIP 重跑 DP2-B32，确认逐请求 TTFT 样本覆盖率、分位数和 NVML 采样峰值；当前保存的 V3 输出来自旧包，需新 run-id。
+2. 采集 GPU utilization 与功耗。批处理下仍不能从整批耗时推导请求级 E2E latency；如需该指标，应另测流式请求路径。
+3. 采集 input/prompt tokens per second；当前输出最多 8 tokens，output token rate 的解释力有限。
 4. 用同一协议测量 Qwen3.5-4B QLoRA adapter 的 serving 性能，与 base model 区分报告。
 
 ## 复现范围与限制
 
 - 当前 Git 版本和 test Notebook 使用 DP=2、每个 replica `max_num_seqs=16`、Runner 全局 `runner_batch_size=32`；两个 replica 并行启动加载。
 - 最新 `outputs/qwen35_4b_test/qwen35_4b_test_vllm_v3/run_summary.json` 为 PASS，682/682 条有效，failed、invalid、pending、prompt leakage 均为 0；这不代表 test accuracy。
-- 当前 batch run 没有逐请求延迟样本（`latency.requests=0`），不能报告 TTFT 或请求级延迟分布。`metrics_shape` 的单条示例值不能代表完整分布。
+- 旧 batch run 没有逐请求延迟样本（`latency.requests=0`），不能从它报告 TTFT 或请求级延迟分布。更新后的包只增加引擎报告的 TTFT 样本，不会伪造请求级端到端延迟。
 - 显存字段记录运行前与运行结束时的 used/free 容量，不是峰值；当前 worker peak 字段为 0。不同 Kaggle session 的后台占用可能不同。本次没有采集 GPU 利用率、功耗、prompt token throughput 或实际账单成本。
 - vLLM 批处理 run 的明细由本地 `outputs/` 中的 `run_summary.json` 保存。`outputs/` 被 Git 忽略，不包含在公开仓库中。
 
