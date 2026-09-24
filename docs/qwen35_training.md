@@ -21,7 +21,7 @@ vLLM is inference-only and cannot produce gradients, so it replaces the generati
 | Stage | Engine |
 |---|---|
 | Training and evaluation-under-training | Transformers 5.17.0 |
-| Adapter reload smoke, dev/confirm evaluation, test inference | vLLM 0.19.1, tensor parallel across both T4 GPUs |
+| Adapter reload smoke, dev/confirm evaluation, test inference | vLLM 0.19.1, DP=2; each replica max_num_seqs=16, Runner batch defaults to 16 |
 
 Both engines share the same data contract, prompt version, image protocol and closed answer space, so their scores are directly comparable. The signed run contract records `engine` and `engine_options`; the same `run-id` cannot mix results from two engines.
 
@@ -31,7 +31,7 @@ The reference backend constrains decoding with a stateful `prefix_allowed_tokens
 
 ## Dual-T4 operation
 
-Two T4s have no NVLink, so tensor parallelism crosses PCIe. The backend therefore runs with `enforce_eager=True`, `disable_custom_all_reduce=True`, and `NCCL_P2P_DISABLE=1`; CUDA-graph capture and peer-to-peer probing over PCIe are the usual cause of hangs on this hardware. `gpu_memory_utilization` defaults to `0.80` so the KV cache does not crowd out the rest of the session.
+Two T4s have no NVLink. The QLoRA inference checks use independent DP replicas to avoid TP all-reduce across PCIe; an optional TP path still uses `enforce_eager=True`, `disable_custom_all_reduce=True`, and `NCCL_P2P_DISABLE=1`. `gpu_memory_utilization` defaults to `0.80` so the KV cache does not crowd out the rest of the session.
 
 ## Attention backend
 
@@ -46,7 +46,7 @@ nvcc ... -gencode=arch=compute_75,code=sm_75 ... -lcudart -lcuda
 
 `TRITON_ATTN` is pure Triton: no nvcc, no link step, and `supports_compute_capability()` returns `True` for every device. It supports `float16`, which is this lane's dtype. Use `--attention-backend FLASHINFER` only on a host that has the driver stubs.
 
-Training stays pinned to a single GPU (`TRAIN_GPU = 0`) to avoid competing with the vLLM tensor-parallel workers for memory.
+Training stays pinned to a single GPU (`TRAIN_GPU = 0`). The DP vLLM replicas are started for adapter reload/evaluation after training, in a separate inference stage.
 
 ## Dependencies
 

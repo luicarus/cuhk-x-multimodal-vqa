@@ -100,7 +100,7 @@ def collect(project: Path):
         "# Independent Qwen3.5-4B QLoRA release (vLLM dual-GPU)\n\n"
         f"Use {NOTEBOOK}. The package embeds the complete five-fold IR8 cache and "
         "contains no model weights or raw videos. Adapter reload checks, dev/confirm "
-        "evaluation and test inference run on vLLM 0.19.1 with tensor parallelism "
+        "evaluation and test inference run on vLLM 0.19.1 with data parallel replicas "
         "across both Kaggle T4 GPUs; training stays on Transformers.\n"
     ).encode("utf-8")
     manifest = {

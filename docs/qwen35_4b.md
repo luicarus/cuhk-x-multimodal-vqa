@@ -18,11 +18,11 @@ Qwen3.5-4B 官方模型卡使用 `AutoModelForMultimodalLM` 与 `AutoProcessor.a
 
 ## vLLM 双卡推理
 
-本 lane 的 test 推理使用 **vLLM 0.19.1，两卡张量并行（TP=2）**；包清单声明 `inference_engine: vllm_0.19.1_tensor_parallel`，Notebook 在解包前会拒绝不匹配的包。这个包只做推理，不含训练栈；后训练 lane 见 `docs/qwen35_training.md`，产物是 `artifacts/cloud_training/qwen35_4b_qlora.zip`。
+本 lane 的 test 推理默认使用 **vLLM 0.19.1、DP=2**：每个 T4 启动一份完整模型，`max_num_seqs=16` 限制每个 replica，Runner 总批次为 32。DP replicas 并行启动和处理各自的请求块。包清单声明 `inference_engine: vllm_0.19.1_dual_gpu`，Notebook 在解包前会拒绝不匹配的包。TP=2 仍可作为替代配置。这个包只做推理，不含训练栈；QLoRA 后训练见 `docs/qwen35_training.md`。
 
 - 参考后端用有状态的 `prefix_allowed_tokens_fn` 约束解码，vLLM 没有该 hook，改用 `StructuredOutputsParams(choice=[...])` 并锁到相同的字面前缀，保证两条引擎的答案空间一致。
 - 引擎构建前会用参考 processor 校验 chat 渲染（`enable_thinking=False`），因为答案边界依赖该精确编码。
-- 两张 T4 没有 NVLink，因此引擎使用 `enforce_eager=True`、`disable_custom_all_reduce=True`、`NCCL_P2P_DISABLE=1`，避免 PCIe 上的 CUDA graph capture 和 P2P 探测导致挂起。
+- 两张 T4 没有 NVLink。默认 DP 将请求分配到两份独立 replica，不需要跨卡 all-reduce；切换到 TP=2 时，模型层跨 PCIe 通信并使用 `enforce_eager=True`、`disable_custom_all_reduce=True`、`NCCL_P2P_DISABLE=1`。
 - 运行合同记录 `engine` / `engine_options`，同一 run-id 不会混用两种引擎的结果。
 
 ## 云端运行
@@ -39,13 +39,13 @@ qwen35_repo/
 
 打开 Notebook 后按顺序执行。它使用自己的 `/kaggle/working/qwen35_runtime_<包哈希>/`，不会读写 baseline 的 `/kaggle/working/repo`、`ir4_runtime` 或 `outputs/ir4_7b_*`。
 
-默认先运行 test 前 16 QA smoke，再运行完整 682 QA：
+默认先运行 test 前 16 QA smoke，再以 Runner batch 32 运行完整 682 QA；smoke 的实际批次受 16 条限额约束：
 
 ```bash
-cuhkx predict --profile qwen35 --backend vllm --tensor-parallel-size 2 --dataset test --limit 16 --run-id qwen35_4b_smoke --weights-dir <weights> --resume
-cuhkx predict --profile qwen35 --backend vllm --tensor-parallel-size 2 --dataset test --run-id qwen35_4b_test --weights-dir <weights> --resume
-cuhkx verify-run --profile qwen35 --run-id qwen35_4b_test
-cuhkx submit --profile qwen35 --run-id qwen35_4b_test
+cuhkx predict --profile qwen35 --backend vllm --tensor-parallel-size 1 --data-parallel-size 2 --max-num-seqs 16 --runner-batch-size 32 --dataset test --limit 16 --run-id qwen35_4b_smoke_dp2_b32 --weights-dir <weights> --resume
+cuhkx predict --profile qwen35 --backend vllm --tensor-parallel-size 1 --data-parallel-size 2 --max-num-seqs 16 --runner-batch-size 32 --dataset test --run-id qwen35_4b_test_dp2_b32 --weights-dir <weights> --resume
+cuhkx verify-run --profile qwen35 --run-id qwen35_4b_test_dp2_b32
+cuhkx submit --profile qwen35 --run-id qwen35_4b_test_dp2_b32
 ```
 
 测试集没有公开答案时，`submit` 只能检查 CSV 完整性，不能计算本地 accuracy。最终对比以相同比赛评估口径/公开榜分数为准。若需要本地 sanity，可把 `--dataset pilot` 作为额外运行，但它不替代 test。

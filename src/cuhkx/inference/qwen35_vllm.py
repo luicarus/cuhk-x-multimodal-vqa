@@ -256,10 +256,30 @@ class Qwen35VLLMBackend:
             # offline LLM entry point that also lets each replica own a distinct
             # device, so the replicas are built in child processes, each with
             # CUDA_VISIBLE_DEVICES pinned to its own card. The children own the
-            # engines; this process only dispatches plain data to them.
+            # engines; this process only dispatches plain data to them. Start all
+            # children before waiting for readiness so their model loads overlap.
             self.engine = None
-            self.engines = [_ReplicaHandle(index, engine_kwargs, weights)
-                            for index in range(data_parallel_size)]
+            self.engines = []
+            try:
+                # Append each handle immediately. If a later process fails to
+                # spawn, the exception path can still close every earlier child.
+                for index in range(data_parallel_size):
+                    self.engines.append(
+                        _ReplicaHandle(index, engine_kwargs, weights, wait_ready=False)
+                    )
+                import concurrent.futures
+
+                with concurrent.futures.ThreadPoolExecutor(
+                        max_workers=data_parallel_size) as pool:
+                    readiness = [pool.submit(replica.wait_ready) for replica in self.engines]
+                    for future in readiness:
+                        future.result()
+            except BaseException:
+                for replica in self.engines:
+                    replica.close()
+                self.engines = []
+                raise
+            self.replica_load_seconds = [replica.load_seconds for replica in self.engines]
             self.adapter_request = None
             self.last_metrics = {"reported": False}
             self.load_seconds = time.perf_counter() - started
@@ -648,6 +668,7 @@ class Qwen35VLLMBackend:
             "answer_constraint": "structured_outputs_choice",
             "lora_adapter": self.adapter_request.lora_name if self.adapter_request else None,
             "load_seconds": self.load_seconds,
+            "replica_load_seconds": getattr(self, "replica_load_seconds", None),
             "workers": self.worker_memory(),
             "image_encode_ms_last": round(getattr(self, "last_encode_seconds", 0.0) * 1000.0, 3),
             # Measured, not assumed: a near-zero hit rate is the expected result
@@ -858,17 +879,33 @@ class _ReplicaHandle:
     independent of the engine version.
     """
 
-    def __init__(self, index: int, engine_kwargs: dict, weights: Path):
+    def __init__(self, index: int, engine_kwargs: dict, weights: Path, *,
+                 wait_ready: bool = True):
         self.index = index
         self._connection = None
         self._process = None
+        self._ready = False
+        self.load_seconds = None
         self._spawn(engine_kwargs, weights)
+        if wait_ready:
+            self.wait_ready()
+
+    def wait_ready(self):
+        """Wait for this child engine to load and report its own load time."""
+        if self._ready:
+            return self.load_seconds
         # The child reports a failure during construction rather than leaving the
         # parent to time out on the first request.
-        status = self._call({"op": "ready"})
-        require(status.get("ok"), f"data-parallel replica {index} failed to start: "
-                                  f"{status.get('error')}")
-        self.load_seconds = float(status.get("load_seconds") or 0.0)
+        try:
+            status = self._call({"op": "ready"})
+            require(status.get("ok"), f"data-parallel replica {self.index} failed to start: "
+                                      f"{status.get('error')}")
+            self.load_seconds = float(status.get("load_seconds") or 0.0)
+            self._ready = True
+            return self.load_seconds
+        except BaseException:
+            self.close()
+            raise
 
     def _spawn(self, engine_kwargs: dict, weights: Path):
         import multiprocessing

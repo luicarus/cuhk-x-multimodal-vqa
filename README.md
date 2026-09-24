@@ -21,15 +21,15 @@ Qwen3.5-4B QLoRA 在固定开发集上也由 `0.44667` 提升至 `0.54133`。Kag
 
 为了让最终选定的 Qwen3.5-4B 不只停留在“模型效果更好”，我又在相同的 2×T4 工作负载下比较了 vLLM 的 TP、DP 和请求批处理配置。下面测的是 **Qwen3.5-4B base model，不包含 QLoRA adapter**；QLoRA adapter serving 尚未进行同口径测试。
 
-| 配置 | 请求批次上限 / `max_num_seqs` | 推理吞吐 | 模型加载 / 682 条端到端耗时 | 运行结束空闲显存 / GPU |
+| 历史配置 | Runner 批次 / 每 replica `max_num_seqs` | 推理吞吐 | 模型加载 / 682 条端到端耗时 | 运行结束空闲显存 / GPU |
 |---|---:|---:|---:|---:|
-| TP2 | 1 | 1.167 req/s | 82.8 s / 675.0 s | 3.66 GiB |
-| TP2-B32 | 32 | 1.430 req/s | 83.2 s / **567.8 s** | 1.29 GiB |
-| DP2-B16 | 16 | **1.549 req/s** | 182.5 s / 630.4 s | 3.14 / 3.03 GiB |
+| TP2 | 1 / 1 | 1.167 req/s | 82.8 s / 675.0 s | 3.66 GiB |
+| TP2-B32 | 32 / 32 | 1.430 req/s | 83.2 s / **567.8 s** | 1.29 GiB |
+| DP2-B16（历史实测） | 16 / 16 | **1.549 req/s** | 182.5 s / 630.4 s | 3.14 / 3.03 GiB |
 
-在这组 682 请求上，DP2-B16 的推理阶段吞吐比 TP2-B32 高 8.3%，但启动时间更长，端到端耗时反而多 62.6 秒。DP 的 16 是日志记录的 `max_num_seqs` 和 Runner 批次大小；现有运行记录没有验证每个 replica 的上限或全局并发，因此不把它换算成 global concurrency。表中显存是运行结束时的空闲显存，**不是 Peak HBM**。
+历史 DP2-B16 的推理阶段吞吐比 TP2-B32 高 8.3%，但当时模型加载是串行的，因此端到端耗时多 62.6 秒。表中 DP2-B16 的 Runner 总批次是 16，每个 replica 的 `max_num_seqs` 也是 16。
 
-DP2-B16 是另一工作区生成的 Kaggle 实测，实现尚未同步进当前 Git 版本；它是实验记录，不是当前 checkout 可复现的配置。完整口径、摊销批次时间、显存观测和限制见 [Qwen3.5-4B vLLM 双卡推理实验](docs/qwen35_vllm_serving.md)。
+当前 test Notebook 使用 DP2、每个 replica 的 `max_num_seqs=16`、Runner 全局 batch=32；两个 replica 先同时启动，再等待模型加载。B32 配置尚未在 Kaggle 测量，不能沿用历史 B16 的吞吐或耗时。完整口径和限制见 [Qwen3.5-4B vLLM 双卡推理实验](docs/qwen35_vllm_serving.md)。
 
 ## 竞赛任务
 

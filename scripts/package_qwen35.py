@@ -70,7 +70,7 @@ def collect(project: Path) -> dict[str, bytes]:
     payloads[PREFIX + "README.md"] = (
         "# Qwen3.5-4B IR4 vLLM test lane\n\n"
         "Independent model comparison. Use notebooks/qwen35-4b-vllm.ipynb.\n"
-        "Test inference runs on vLLM 0.19.1 with tensor parallelism across both\n"
+        "Test inference runs on vLLM 0.19.1 with data parallel replicas across both\n"
         "Kaggle T4 GPUs. This package is inference-only: it contains no training\n"
         "stack and no model weights.\n"
         "The Qwen2.5-VL-7B baseline package and results are not included or modified.\n"

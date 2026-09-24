@@ -46,8 +46,8 @@ PINNED_REVISION = ""  # 留空则由固定环境中的 HfApi 解析并写入运�
 # 双卡拓扑：两种方式，互斥。
 #   DP（data parallel）：每张卡一份完整模型，各自独立服务请求，卡间零通信。
 #   TP（tensor parallel）：一份模型切到两张卡，每次前向都要跨 PCIe all-reduce。
-# T4 之间没有 NVLink，TP 的通信开销在小 prefill + 极短 decode 的负载上占比很高，
-# 所以本实验改为 DP，并把 batch 减半对照。
+# T4 之间没有 NVLink，TP 每层通信会走 PCIe；本轮使用 DP2。
+# 两个模型副本并行加载，Runner 每批提交 32 条、每个 replica 调度上限为 16。
 PARALLEL_MODE = "dp"          # "dp" 或 "tp"
 DATA_PARALLEL = 2 if PARALLEL_MODE == "dp" else 1
 TENSOR_PARALLEL = 1 if PARALLEL_MODE == "dp" else 2
@@ -57,8 +57,13 @@ GPU_MEMORY_UTILIZATION = 0.80
 # 驱动，Kaggle 容器没有 stubs），报 "cannot find -lcuda"。TRITON_ATTN 是纯 Triton
 # 实现，不需要 nvcc/链接，因此作为默认值。
 ATTENTION_BACKEND = "TRITON_ATTN"
-# 上一轮 B 为 32；本轮减半到 16，配合 DP 观察 batch 维度的收益曲线。
-MAX_NUM_SEQS = 16
+# DP2: 每个 vLLM replica 最多调度 16 条；Runner 向两张卡提交全局 batch 32，
+# 后端并行拆成每个 replica 16 条。TP2 时每个 engine 和 Runner batch 都是 32.
+MAX_NUM_SEQS = 16 if PARALLEL_MODE == "dp" else 32
+RUNNER_BATCH_SIZE = 32
+RUN_TAG = (f"dp{DATA_PARALLEL}" if PARALLEL_MODE == "dp" else f"tp{TENSOR_PARALLEL}") + f"_b{RUNNER_BATCH_SIZE}"
+SMOKE_RUN_ID = f"qwen35_4b_smoke_{RUN_TAG}"
+TEST_RUN_ID = f"qwen35_4b_test_{RUN_TAG}"
 '''),
     cell("markdown", "## 1. 验证 Qwen3.5 vLLM 包并准备独立工作目录"),
     cell("code", '''
@@ -212,11 +217,12 @@ VLLM = ["--backend", "vllm",
         "--data-parallel-size", str(DATA_PARALLEL),
         "--gpu-memory-utilization", str(GPU_MEMORY_UTILIZATION),
         "--attention-backend", ATTENTION_BACKEND,
-        "--max-num-seqs", str(MAX_NUM_SEQS)]
+        "--max-num-seqs", str(MAX_NUM_SEQS),
+        "--runner-batch-size", str(RUNNER_BATCH_SIZE)]
 cloud("predict", "--profile", "qwen35", *VLLM, "--dataset", "test", "--limit", "16",
-      "--run-id", "qwen35_4b_smoke", "--weights-dir", str(WEIGHTS), "--resume")
-cloud("verify-run", "--profile", "qwen35", "--run-id", "qwen35_4b_smoke")
-smoke = json.loads((REPO / "outputs/qwen35_4b_smoke/run_summary.json").read_text())
+      "--run-id", SMOKE_RUN_ID, "--weights-dir", str(WEIGHTS), "--resume")
+cloud("verify-run", "--profile", "qwen35", "--run-id", SMOKE_RUN_ID)
+smoke = json.loads((REPO / "outputs" / SMOKE_RUN_ID / "run_summary.json").read_text())
 backend_metadata = smoke["backend"]
 if backend_metadata.get("backend") != "qwen35_4b_vllm":
     raise RuntimeError("smoke run did not use the vLLM engine")
@@ -224,6 +230,12 @@ if backend_metadata.get("tensor_parallel_size") != TENSOR_PARALLEL:
     raise RuntimeError(f"vLLM ran with TP={backend_metadata.get('tensor_parallel_size')}, expected {TENSOR_PARALLEL}")
 if PARALLEL_MODE == "dp" and backend_metadata.get("data_parallel_size") != DATA_PARALLEL:
     raise RuntimeError(f"vLLM ran with DP={backend_metadata.get('data_parallel_size')}, expected {DATA_PARALLEL}")
+resolved = json.loads((REPO / "outputs" / SMOKE_RUN_ID / "resolved_config.json").read_text())
+options = resolved["contract"]["engine_options"]
+if options.get("max_num_seqs") != MAX_NUM_SEQS:
+    raise RuntimeError(f"engine max_num_seqs={options.get('max_num_seqs')}, expected {MAX_NUM_SEQS}")
+if options.get("runner_batch_size") != RUNNER_BATCH_SIZE:
+    raise RuntimeError(f"runner_batch_size={options.get('runner_batch_size')}, expected {RUNNER_BATCH_SIZE}")
 if backend_metadata.get("attention_backend") != ATTENTION_BACKEND:
     raise RuntimeError(f"vLLM ran with attention backend {backend_metadata.get('attention_backend')}, expected {ATTENTION_BACKEND}")
 # Worker 显存遥测必须真的采到数据：序列化失败时 workers 为空、error 非空。
@@ -245,11 +257,11 @@ print(json.dumps({"backend": backend_metadata, "prefix_cache": prefix}, indent=2
     cell("markdown", "## 5. 完整 test：682 QA 与提交文件（vLLM）"),
     cell("code", '''
 cloud("predict", "--profile", "qwen35", *VLLM, "--dataset", "test",
-      "--run-id", "qwen35_4b_test", "--weights-dir", str(WEIGHTS), "--resume")
-cloud("verify-run", "--profile", "qwen35", "--run-id", "qwen35_4b_test")
-cloud("submit", "--profile", "qwen35", "--run-id", "qwen35_4b_test")
-print("Qwen3.5 submission:", REPO / "outputs/qwen35_4b_test/submission.csv")
-print("Qwen3.5 run evidence:", REPO / "outputs/qwen35_4b_test")
+      "--run-id", TEST_RUN_ID, "--weights-dir", str(WEIGHTS), "--resume")
+cloud("verify-run", "--profile", "qwen35", "--run-id", TEST_RUN_ID)
+cloud("submit", "--profile", "qwen35", "--run-id", TEST_RUN_ID)
+print("Qwen3.5 submission:", REPO / "outputs" / TEST_RUN_ID / "submission.csv")
+print("Qwen3.5 run evidence:", REPO / "outputs" / TEST_RUN_ID)
 '''),
 ]
 
@@ -277,7 +289,7 @@ CELLS[0]["source"] = """# Qwen3.5-4B IR4 test (vLLM dual-GPU)
 
 This independent comparison reuses the existing IR8 cache and selects frames 2, 4, 6, and 8. Create the package locally, copy its printed `manifest_sha256` into `EXPECTED_MANIFEST_SHA256` in the first code cell, and attach that exact ZIP or extracted package as a private Kaggle input. The digest must come from a trusted local build.
 
-Test inference runs on **vLLM 0.19.1 with one full replica per T4 (data parallel, DP=2, scheduler concurrency 16)**. Two T4s have no NVLink, so tensor parallelism would pay a PCIe all-reduce on every forward pass; independent replicas remove that cost entirely. Set `PARALLEL_MODE = "tp"` to reproduce the earlier tensor-parallel rounds. The engine constrains decoding to the same closed answer space as the Transformers backend and checks its chat rendering against the reference processor before starting, so its scores stay comparable with the other lanes. The signed run contract records the topology, so one run-id cannot mix results from two engines.
+Test inference runs on **vLLM 0.19.1 with data parallelism across two T4s**. Each replica has a scheduler limit of 16 sequences; the Runner submits a global batch of 32 and splits it into 16 requests per replica. Both replica processes start before either model load is awaited, so the DP model initialization overlaps. The GPUs have no NVLink, so independent replicas also avoid TP all-reduce on every forward pass. Set `PARALLEL_MODE = "tp"` to reproduce the earlier TP configuration. The signed run contract records both per-replica and Runner batch limits.
 
 The smoke cell also asserts that worker GPU memory telemetry is non-empty and that the prefix-cache hit rate is measured rather than missing.
 

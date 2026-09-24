@@ -12,12 +12,12 @@
 
 ## 配置与结果
 
-| Run | 执行方式 | 推理吞吐 | 单请求延迟统计 | 批次摊销执行时间 | 加载 / 端到端总耗时 |
-|---|---|---:|---|---:|---:|
-| `qwen35_4b_test` | Transformers，batch 1 | 未单独记录 | 未记录 | — | 7.58 / 768.62 s |
-| `qwen35_4b_test_vllm_v1` | vLLM TP=2，逐条提交 | 1.1672 req/s | mean 856.786 ms；P50 898.535；P95 1010.179；P99 1080.654 | — | 82.81 / 675.00 s |
-| `qwen35_4b_test_vllm_v2` | vLLM TP=2，`max_num_seqs=32` | 1.4303 req/s | 未记录 | 699.156 ms / 请求 | 83.24 / 567.83 s |
-| `qwen35_4b_test_vllm_v3` | vLLM DP=2、TP=1，`max_num_seqs=16` | 1.5490 req/s | 未记录 | 645.577 ms / 请求 | 182.53 / 630.41 s |
+| Run | 执行方式 | Runner 总批次 | 每 replica `max_num_seqs` | 推理吞吐 | 单请求延迟统计 | 批次摊销执行时间 | 加载 / 端到端总耗时 |
+|---|---|---:|---:|---:|---|---:|---:|
+| `qwen35_4b_test` | Transformers | 1 | — | 未单独记录 | 未记录 | — | 7.58 / 768.62 s |
+| `qwen35_4b_test_vllm_v1` | vLLM TP=2，逐条提交 | 1 | 1 | 1.1672 req/s | mean 856.786 ms；P50 898.535；P95 1010.179；P99 1080.654 | — | 82.81 / 675.00 s |
+| `qwen35_4b_test_vllm_v2` | vLLM TP=2 | 32 | 32 | 1.4303 req/s | 未记录 | 699.156 ms / 请求 | 83.24 / 567.83 s |
+| `qwen35_4b_test_vllm_v3` | vLLM DP=2、TP=1 | 16 | 16 | 1.5490 req/s | 未记录 | 645.577 ms / 请求 | 182.53 / 630.41 s |
 
 TP2-B32 由 22 个 batch 处理完 682 条请求，平均 batch 大小 31.0、平均 batch 时间 21.674 s；DP2-B16 使用 43 个 batch，平均大小 15.86、平均 batch 时间 10.239 s。批次摊销执行时间是批次时长除以请求数，不是单请求 P50/P95，因此与 TP2 的请求延迟分栏记录。
 
@@ -50,7 +50,7 @@ DP2-B16 与 TP2-B32 有 675/682 条预测一致，7 条输出不同；两者的 
 
 ## 并发口径
 
-V3 的运行合同记录 `data_parallel_size=2`、`tensor_parallel_size=1`、`max_num_seqs=16`，Runner 实际每批提交最多 16 条。现有运行结果没有单独记录每个 replica 的并发上限或 DP 的全局有效并发，因此这里只报告配置值和实际 batch 大小，不把 DP2-B16 换算成 global concurrency 32。
+DP2-B16 历史 run 的 Runner 总批次是 16，DP 后端把这批请求分给两个 replica，每个 replica 收到 8 条；它不是每个 replica 各收到 16 条。当前代码将两个上限分开记录：`max_num_seqs=16` 是每个 vLLM replica 的 scheduler 上限，`runner_batch_size=32` 是 Runner 的总批次；DP2-B32 会把全局 32 条拆成每个 replica 16 条。新 B32 配置尚未运行，本文不把历史 B16 的吞吐、显存或加载时间套用到它。
 
 ## 下一步测量
 
@@ -63,8 +63,8 @@ V3 的运行合同记录 `data_parallel_size=2`、`tensor_parallel_size=1`、`ma
 
 ## 复现范围与限制
 
-- 当前 Git 版本包含 TP=2、`max_num_seqs=32` 的 vLLM 路径，可通过 `notebooks/qwen35-4b-vllm.ipynb` 运行。
-- V3 的 DP=2 / TP=1 / `max_num_seqs=16` 来自另一工作区的 Kaggle 实测；本地 `outputs/qwen35_4b_test/qwen35_4b_test_vllm_v3/resolved_config.json` 记录了运行配置，但对应实现尚未同步进当前仓库。因此 V3 是运行结果记录，不能声称当前 checkout 可直接复现。
+- 当前 Git 版本包含 TP 与 DP 路径。test Notebook 配置为 DP=2、每个 replica `max_num_seqs=16`、Runner 全局 `runner_batch_size=32`，两个 replica 先启动并行加载，再等待都 ready。
+- V3 的 DP2-B16 指标来自旧的串行启动实现；本地 `outputs/qwen35_4b_test/qwen35_4b_test_vllm_v3/resolved_config.json` 保存了当次配置。当前代码可以运行该拓扑，但旧的加载时间不代表并行启动版本；DP2-B32 和并行启动效果尚无新的 Kaggle 测量。
 - 显存字段记录运行前与运行结束时的 used/free 容量，不是峰值；不同 Kaggle session 的后台占用可能不同。本次没有采集 GPU 利用率、功耗或实际账单成本。
 - vLLM 批处理 run 的准确 batch 级明细由本地 `outputs/` 中的 `run_summary.json` 保存。`outputs/` 被 Git 忽略，不包含在公开仓库中。
 

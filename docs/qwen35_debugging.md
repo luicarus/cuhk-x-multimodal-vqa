@@ -74,6 +74,6 @@ CONFIRMED = accuracy("qwen35_pt_adapter_confirm") > accuracy("qwen35_pt_base_con
 1. 运行 `tests/test_qwen35_training.py`。
 2. 重新生成 Notebook，并确认所有代码 Cell 可编译。
 3. 重新打包 ZIP，检查 14,835 个文件及 test、pilot、五折训练缓存。
-4. GPU 相关修复在 Kaggle 先跑四步 smoke 与 vLLM TP=2 短跑，再开始完整 SFT。
+4. GPU 相关修复在 Kaggle 先跑四步 smoke 与 Notebook 当前选择的双卡 DP smoke，再开始完整 SFT。
 
 成功训练至少应满足：训练 loss 有限、出现真实 optimizer 更新、LoRA B 非零、adapter 可重载。当前已记录的 dev 结果为 baseline `0.4466667`、adapter `0.5413333`，来源为用户完成的 Kaggle 运行。

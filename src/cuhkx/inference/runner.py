@@ -290,8 +290,13 @@ def run_predictions(config, dataset, limit, run_id, model_source, backend_factor
         memory_peaks = {}
         if pending:
             memory_before = sample_gpu_memory(profiling_torch())
-        batch_size = int((engine_options or {}).get("max_num_seqs") or 1)
-        require(batch_size >= 1, "max_num_seqs must allow at least one sequence")
+        options = engine_options or {}
+        engine_batch_limit = int(options.get("max_num_seqs") or 1)
+        data_parallel_size = int(options.get("data_parallel_size") or 1)
+        batch_size = int(options.get("runner_batch_size") or engine_batch_limit)
+        require(batch_size >= 1, "runner batch size must allow at least one request")
+        require(batch_size <= engine_batch_limit * data_parallel_size,
+                "runner batch size exceeds aggregate per-replica scheduler capacity")
         if batch_size > 1:
             # A concurrent scheduler is pointless unless the runner submits more
             # than one request at a time; the engine setting selects the path.

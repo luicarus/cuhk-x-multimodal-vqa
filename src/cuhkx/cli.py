@@ -62,8 +62,12 @@ def add_inference_backend(command):
                               "FlashInfer JIT-compiles SM 7.5 kernels and fails to link "
                               "libcuda.so on Kaggle (no driver stubs).")
     command.add_argument("--max-num-seqs", type=int, default=1,
-                         help="vLLM scheduler concurrency. Above 1 the runner submits "
-                              "requests in batches so the engine can interleave them.")
+                         help="Maximum sequences scheduled by each vLLM engine replica. "
+                              "For DP, this is the per-replica limit.")
+    command.add_argument("--runner-batch-size", type=int, default=None,
+                         help="Requests submitted by the runner in one batch across all "
+                              "replicas. Defaults to --max-num-seqs; DP capacity is the "
+                              "per-replica limit multiplied by data-parallel size.")
 
 
 def default_backend(profile):
@@ -103,6 +107,14 @@ def engine_options(args, profile):
                or default_attention_backend(),
                "max_num_seqs": args.max_num_seqs}
     data_parallel = int(getattr(args, "data_parallel_size", 1) or 1)
+    runner_batch_size = getattr(args, "runner_batch_size", None)
+    if runner_batch_size is not None:
+        runner_batch_size = int(runner_batch_size)
+        require(runner_batch_size >= 1, "runner batch size must allow at least one request")
+        capacity = int(args.max_num_seqs) * data_parallel
+        require(runner_batch_size <= capacity,
+                f"runner batch size {runner_batch_size} exceeds aggregate replica capacity {capacity}")
+        options["runner_batch_size"] = runner_batch_size
     if data_parallel > 1:
         # Recorded because it changes the topology: two replicas each holding a
         # full model is a different run from one model split over two cards, and

@@ -4,13 +4,13 @@
 - `package_cloud.py`：白名单打包，原样包含用户维护的 `notebooks/cuhk-x-base7b.ipynb`；解包校验在临时目录进行。默认不保存额外验收报告。
 - `package_training.py`：只生成包含完整五折缓存的独立后训练 ZIP；数据不齐时拒绝打包。
 - `build_training_notebook.py`：只创建完整数据版后训练 Notebook，拒绝覆盖已存在文件，不操作 baseline Notebook。
-- `package_qwen35.py`：生成独立 Qwen3.5-4B test 包 `artifacts/cloud/qwen35_4b.zip`，test 推理走 vLLM 0.19.1 双卡张量并行，声明 `inference_engine: vllm_0.19.1_tensor_parallel`；复用 test/pilot IR4 缓存，不包含训练栈和模型权重。
+- `package_qwen35.py`：生成独立 Qwen3.5-4B test 包 `artifacts/cloud/qwen35_4b.zip`，test 推理走 vLLM 0.19.1 双卡；默认 DP=2、Runner batch=32、每 replica `max_num_seqs=16`，包清单声明 `inference_engine: vllm_0.19.1_dual_gpu`；复用 test/pilot IR4 缓存，不包含训练栈和模型权重。
 - `build_qwen35_notebook.py`：创建独立 Qwen3.5-4B vLLM test Notebook（`notebooks/qwen35-4b-vllm.ipynb`），拒绝覆盖已存在文件。
 - `bench_report.py`：汇总各次运行的**基础设施指标**（吞吐、延迟分位、阶段拆分、逐条一致性），用于对比在不同引擎/并行策略下的表现；只读 `outputs/`，不修改任何运行结果。
 
 业务操作统一使用 CLI，原 baseline Notebook 不提供生成器或覆盖入口。
 
-- `package_qwen35_training.py`: builds the independent complete-data Qwen3.5-4B QLoRA package as `artifacts/cloud_training/qwen35_4b_qlora.zip`, declaring `inference_engine: vllm_0.19.1_tensor_parallel`.
+- `package_qwen35_training.py`: builds the independent complete-data Qwen3.5-4B QLoRA package as `artifacts/cloud_training/qwen35_4b_qlora.zip`, declaring `inference_engine: vllm_0.19.1_dual_gpu`; adapter checks use DP=2 with the notebook's Runner batch default.
 - `build_qwen35_training_notebook.py`: builds its reproducible vLLM dual-GPU cloud Notebook, `notebooks/qwen35-4b-qlora-vllm.ipynb`.
 
 ## 推理性能对比
