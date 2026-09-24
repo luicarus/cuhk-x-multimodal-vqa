@@ -243,12 +243,13 @@ def test_summary_latency_is_not_part_of_the_verified_contract():
 def _write_run(root: Path, run_id: str, *, elapsed: float, load: float, resumed: int,
                rows: list[tuple[str, str]], latency: dict | None = None,
                gpu_memory: dict | None = None, engine: str = "vllm",
-               dataset: str = "pilot") -> None:
+               dataset: str = "pilot", engine_options: dict | None = None,
+               signature: str = "s") -> None:
     directory = root / run_id
     directory.mkdir(parents=True)
     backend = {"backend": "test_backend", "load_seconds": load, "versions": {}}
     summary = {
-        "status": "PASS", "signature": "s", "target_ids": [qa for qa, _ in rows],
+        "status": "PASS", "signature": signature, "target_ids": [qa for qa, _ in rows],
         "counts": {"valid": len(rows), "invalid": 0, "failed": 0, "pending": 0},
         "resumed_valid": resumed, "elapsed_seconds": elapsed, "backend": backend,
     }
@@ -260,7 +261,8 @@ def _write_run(root: Path, run_id: str, *, elapsed: float, load: float, resumed:
     # Engine identity lives in the signed contract, not in the summary.
     (directory / "resume_state.json").write_text(
         json.dumps({"contract": {"dataset": dataset, "engine": engine,
-                                 "engine_options": {"attention_backend": "TRITON_ATTN"}}}),
+                                 "engine_options": engine_options or
+                                 {"attention_backend": "TRITON_ATTN"}}}),
         encoding="utf-8")
     with (directory / "predictions.csv").open("w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle, lineterminator="\n")
@@ -449,6 +451,39 @@ def test_report_shows_nvml_sampled_gpu_memory_peaks(tmp_path):
     assert "sample peak" in result.stdout
     assert "13500.0" in result.stdout
     assert "100 ms interval" in result.stdout
+
+
+def test_report_highlights_best_single_run_for_repeated_batch_config(tmp_path):
+    options = {"data_parallel_size": 2, "tensor_parallel_size": 1,
+               "runner_batch_size": 32, "max_num_seqs": 16,
+               "attention_backend": "TRITON_ATTN"}
+    for run_id, throughput, ttft in (("rep1", 1.39, 12000.0),
+                                     ("rep2", 1.41, 11800.0),
+                                     ("rep3", 1.52, 11200.0)):
+        latency = {
+            "requests": 0, "warmup_skipped": 0, "batched": True,
+            "batch": {"batches": 1, "requests": 3, "batch_sizes": [3],
+                      "total_ms": 2000.0, "mean_batch_ms": 2000.0,
+                      "mean_batch_size": 3.0, "throughput_rps": throughput,
+                      "token_rate": 3.0, "amortized_ms_per_request": 2000 / 3},
+            "ttft_ms": {"count": 3, "requests": 3, "coverage": 1.0,
+                        "reported_by_engine": True, "p50": ttft,
+                        "p95": ttft + 1000, "p99": ttft + 2000},
+        }
+        _write_run(tmp_path, run_id, elapsed=3.0, load=0.0, resumed=0,
+                   rows=[("p1", "A"), ("p2", "B"), ("p3", "C")],
+                   latency=latency, engine_options=options, signature="same-input")
+
+    json_path = tmp_path / "summary.json"
+    result = _report(tmp_path, "--json", str(json_path))
+    assert result.returncode == 0, result.stderr
+    assert "best single run per repeated configuration" in result.stdout
+    assert "rep3" in result.stdout
+    assert "1.5200" in result.stdout
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+    winner = next(run for run in payload if run["run_id"] == "rep3")
+    assert winner["best_in_repeat_group"] is True
+    assert winner["repeat_count"] == 3
 
 
 def test_timer_batch_view_amortizes_over_the_whole_run():

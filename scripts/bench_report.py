@@ -69,6 +69,7 @@ def load_run(outputs: Path, run_id: str) -> dict:
     measured = executed > 0 and bool(backend) and backend.get("backend") != ""
     return {
         "run_id": run_id,
+        "signature": summary.get("signature"),
         "engine": contract.get("engine") or summary.get("engine") or "transformers",
         "engine_options": contract.get("engine_options") or summary.get("engine_options") or {},
         "backend": backend.get("backend", "?"),
@@ -155,6 +156,51 @@ def _fmt(value, width, places=3):
     return text.rjust(width)
 
 
+def repeated_batch_best_runs(runs):
+    """Mark and return the highest-throughput sample for repeated configs.
+
+    A group requires the same signed run signature, engine options, software
+    versions, workload size, and memory-monitor mode. The selected row is the
+    best observed single run, never an average.
+    """
+    groups = {}
+    for run in runs:
+        batch = (run.get("latency") or {}).get("batch") or {}
+        if not run.get("measured") or batch.get("throughput_rps") is None:
+            continue
+        polling = ((run.get("gpu_memory") or {}).get("peaks") or {}).get("device_polling") or {}
+        key = (
+            run.get("signature"),
+            run.get("engine"),
+            run.get("dataset"),
+            run.get("requests"),
+            json.dumps(run.get("engine_options") or {}, sort_keys=True, default=str),
+            json.dumps(run.get("versions") or {}, sort_keys=True, default=str),
+            polling.get("source"),
+            polling.get("interval_ms"),
+        )
+        groups.setdefault(key, []).append(run)
+
+    best_runs = []
+    for group in groups.values():
+        if len(group) < 2:
+            continue
+        best = max(group, key=lambda run: run["latency"]["batch"]["throughput_rps"])
+        options = best.get("engine_options") or {}
+        dp = int(options.get("data_parallel_size") or 1)
+        tp = int(options.get("tensor_parallel_size") or 1)
+        parallel = f"DP{dp}" if dp > 1 else f"TP{tp}"
+        batch_size = int(options.get("runner_batch_size") or
+                         int(options.get("max_num_seqs") or 1) * dp)
+        label = f"{parallel}-B{batch_size}"
+        for run in group:
+            run["repeat_group"] = label
+            run["repeat_count"] = len(group)
+            run["best_in_repeat_group"] = run is best
+        best_runs.append({"label": label, "count": len(group), "best": best})
+    return best_runs
+
+
 def discover_runs(outputs: Path) -> list:
     """Find every finished run at any depth, as paths relative to --outputs.
 
@@ -195,6 +241,7 @@ def main() -> int:
             runs.append(load_run(outputs, run_id))
         except ValueError as error:
             print(f"skipping {run_id}: {error}")
+    best_repeated_runs = repeated_batch_best_runs(runs)
 
     print(f"{'run':<34} {'engine':<13} {'dataset':<8} {'N':>5} {'ran':>5} {'valid':>6} "
           f"{'load_s':>8} {'infer_s':>9} {'s/req':>8} {'req/s':>8}")
@@ -210,6 +257,30 @@ def main() -> int:
               f"{run['requests']:>5} {run['executed']:>5} {run['valid']:>6} "
               f"{run['load_seconds']:>8.1f} {run['inference_seconds']:>9.1f} "
               f"{_fmt(run['seconds_per_request'], 8)} {_fmt(run['requests_per_second'], 8)}")
+
+    if best_repeated_runs:
+        print("\nbest single run per repeated configuration (highest batch req/s; not averaged)")
+        print(f"{'config':<14} {'runs':>4} {'selected run':<48} {'batch req/s':>12} "
+              f"{'TTFT coverage':>13} {'TTFT P50/P95/P99 ms':>24} {'NVML peak GiB/GPU':>20}")
+        print("-" * 150)
+        for group in best_repeated_runs:
+            run = group["best"]
+            latency = run["latency"]
+            batch = latency["batch"]
+            ttft = latency.get("ttft_ms") or {}
+            ttft_values = "/".join(
+                "-" if ttft.get(field) is None else f"{ttft[field]:.0f}"
+                for field in ("p50", "p95", "p99"))
+            polling = ((run.get("gpu_memory") or {}).get("peaks") or {}).get("device_polling") or {}
+            devices = polling.get("devices") or {}
+            peak_values = "/".join(
+                f"{devices[device]['sampled_peak_used_mib'] / 1024:.2f}"
+                for device in sorted(devices)
+                if devices[device].get("sampled_peak_used_mib") is not None)
+            print(f"{group['label']:<14} {group['count']:>4} {run['run_id']:<48} "
+                  f"{_fmt(batch.get('throughput_rps'), 12, 4)} "
+                  f"{_fmt(ttft.get('coverage'), 13, 3)} {ttft_values:>24} "
+                  f"{peak_values or '-':>20}")
 
     with_latency = [run for run in runs if run["latency"].get("requests")]
     with_batches = [run for run in runs if run["latency"].get("batched")]

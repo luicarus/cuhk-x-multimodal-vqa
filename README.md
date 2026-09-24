@@ -4,6 +4,8 @@
 
 > An end-to-end multimodal VQA solution for privacy-preserving human activity understanding, with deterministic frame selection, constrained decoding, model comparison, and QLoRA post-training.
 
+> **AI Infra · Qwen3.5-4B / 2×T4** — Best single run of 3 with vLLM DP2-B32: **1.5171 req/s**, TTFT P50/P95/P99 **11.30/17.14/21.67 s** (682/682 requests), and NVML sampled peak device memory **12.64 GiB/GPU**.
+
 ## 项目结果
 
 ### 任务效果
@@ -25,11 +27,11 @@ Qwen3.5-4B QLoRA 在固定开发集上也由 `0.44667` 提升至 `0.54133`。Kag
 |---|---:|---:|---:|---:|
 | TP2 | 1 / 1 | 1.167 req/s | 82.8 s / 675.0 s | — |
 | TP2-B32 | 32 / 32 | 1.430 req/s | 83.2 s / **567.8 s** | — |
-| **DP2-B32（最新）** | 32 / 16 | **1.393 req/s** | **104.3 s / 602.6 s** | **12.64 / 12.78 GiB** |
+| **DP2-B32（3 次中最佳）** | 32 / 16 | **1.517 req/s** | **97.5 s / 554.7 s** | **12.64 / 12.64 GiB** |
 
-最新 DP2-B32 完成 682 条请求，22 个批次（21×32、末批 10），平均摊销 718.0 ms/请求。逐请求引擎 TTFT 覆盖 682/682 条：P50 12.12 s、P95 17.49 s、P99 26.23 s。TTFT 从 vLLM 收到请求时开始并包含调度等待，不是请求端到端延迟。
+最佳单次完成 682 条请求，22 个批次（21×32、末批 10），批次摊销 659.2 ms/请求。逐请求引擎 TTFT 覆盖 682/682 条：P50 11.30 s、P95 17.14 s、P99 21.67 s。TTFT 从 vLLM 收到请求时开始并包含调度等待，不是请求端到端延迟。
 
-NVML 以 100 ms 间隔采样预测期间的设备显存，采样峰值为 GPU0/GPU1 **12.64 / 12.78 GiB**，最低空闲量为 2.36 / 2.22 GiB。相比上一轮未启用监控的 DP2-B32（1.5001 req/s），本轮吞吐低 7.2%、端到端多 42.8 秒；单次 Kaggle 运行无法区分监控开销和运行环境波动，不能据此归因。设备级采样包含其他进程占用，短于采样间隔的尖峰可能漏掉。完整口径见 [Qwen3.5-4B vLLM 双卡推理实验](docs/qwen35_vllm_serving.md)。
+三次 DP2-B32 吞吐为 1.3928、1.4097、1.5171 req/s，均值 1.4399 req/s；README 和 `bench_report.py` 显式标出最高的单次结果，不把它当作平均表现。三次配置、签名和预测文件哈希一致。NVML 以 100 ms 间隔采样预测期间的设备显存，最佳运行采样峰值为 GPU0/GPU1 **12.64 / 12.64 GiB**，最低空闲量均为 2.36 GiB。设备级采样包含其他进程占用，短于采样间隔的尖峰可能漏掉。完整口径见 [Qwen3.5-4B vLLM 双卡推理实验](docs/qwen35_vllm_serving.md)。
 
 ## 竞赛任务
 
