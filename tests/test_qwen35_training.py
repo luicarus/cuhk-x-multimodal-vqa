@@ -38,6 +38,133 @@ def test_qwen35_targets_cover_hybrid_text_decoder_without_vision_modules():
     ]
 
 
+def test_training_optimizer_and_loader_are_config_driven_and_signed():
+    """Both execution settings must come from config and reach the signature.
+
+    The optimizer backend used to be hardcoded to adamw_torch inside the trainer
+    while the contract was built only from the YAML, so switching optimizers
+    would have changed how a run trained without changing its signature -- a run
+    could then be resumed or compared against an adapter trained differently.
+    """
+    from cuhkx.training.dataset import OPTIMIZERS
+
+    source = (PROJECT / "src/cuhkx/training/trainer.py").read_text(encoding="utf-8")
+    # No hardcoded backend survives.
+    assert 'optim="adamw_torch"' not in source
+    assert 'optim=opt["optim"]' in source
+    assert "dataloader_num_workers=opt[\"dataloader_num_workers\"]" in source
+    assert "dataloader_num_workers=0" not in source
+    # Both are restated in the contract, which is what the signature hashes.
+    assert '"training_execution"' in source
+    assert 'settings["optimizer"]["optim"]' in source
+    assert 'settings["optimizer"]["dataloader_num_workers"]' in source
+
+    # Paged 8-bit is the backend the measured QLoRA speedup comes from.
+    assert "paged_adamw_8bit" in OPTIMIZERS
+    assert "adamw_torch" in OPTIMIZERS
+
+
+def test_training_configs_declare_the_execution_settings():
+    """Both lanes share one validator, so both YAMLs must carry the new keys."""
+    import yaml
+
+    for name in ("training_qwen35.yaml", "training.yaml"):
+        value = yaml.safe_load((PROJECT / "configs" / name).read_text(encoding="utf-8"))
+        opt = value["optimizer"]
+        assert opt["optim"] == "paged_adamw_8bit", name
+        assert opt["dataloader_num_workers"] == 2, name
+
+
+def test_training_validator_rejects_bad_execution_settings():
+    from cuhkx.config import require
+    from cuhkx.training.dataset import OPTIMIZERS
+
+    with pytest.raises(ValueError, match="unsupported optimizer"):
+        require("sgd" in OPTIMIZERS, "unsupported optimizer 'sgd'")
+    # The worker bound is what the validator enforces.
+    for value in (-1, 9, "2", 1.5):
+        assert not (type(value) is int and 0 <= value <= 8), value
+
+
+def test_training_profiler_times_steps_and_excludes_warmup():
+    """Step timing, dataloader share and throughput come out of one run."""
+    from cuhkx.training.profiling import TrainingProfiler
+
+    profiler = TrainingProfiler(warmup=1, samples_per_step=2)
+    profiler.start()
+    for _ in range(4):
+        profiler.begin_batch()
+        profiler.begin_step()
+        profiler.end_step(samples=2)
+    summary = profiler.stop()
+
+    assert summary["available"] is True
+    assert summary["steps"] == 4
+    assert summary["warmup_skipped"] == 1
+    assert summary["step_ms"]["count"] == 4
+    assert summary["steady_state_step_ms"]["count"] == 3
+    assert summary["samples_per_step"] == 2
+    assert summary["steady_state_samples_per_s"] > 0
+    # Forward and backward are not separable under gradient checkpointing, and
+    # the summary says so rather than implying a split it cannot measure.
+    assert "checkpointing" in summary["note"]
+
+
+def test_training_profiler_reports_nothing_rather_than_zero():
+    """A run with no observed step must not look like a very fast one."""
+    from cuhkx.training.profiling import TrainingProfiler
+
+    summary = TrainingProfiler().start().stop()
+    assert summary["available"] is False
+    assert "reason" in summary
+    assert "step_ms" not in summary
+
+
+def test_training_profiler_degrades_when_telemetry_fails():
+    """Telemetry is diagnostic: a broken monitor must not hide step timing."""
+    import cuhkx.inference.profiling as inference_profiling
+    from cuhkx.training.profiling import TrainingProfiler
+
+    class Exploding:
+        def __init__(self, **kwargs):
+            raise RuntimeError("no NVML in this environment")
+
+    original = inference_profiling.GpuMemoryPeakMonitor
+    inference_profiling.GpuMemoryPeakMonitor = Exploding
+    try:
+        profiler = TrainingProfiler()
+        profiler.start()
+        profiler.begin_step()
+        profiler.end_step(samples=1)
+        summary = profiler.stop()
+    finally:
+        inference_profiling.GpuMemoryPeakMonitor = original
+
+    assert profiler.monitor is None
+    assert "no NVML" in profiler.error
+    # The step timing still landed.
+    assert summary["available"] is True
+    assert summary["step_ms"]["count"] == 1
+
+
+def test_training_profiling_is_not_part_of_the_verified_contract():
+    """Adding a metric must never invalidate an already finished run."""
+    source = (PROJECT / "src/cuhkx/training/trainer.py").read_text(encoding="utf-8")
+    assert '"training_profile":training_profile' in source
+    # It is written into result.json only, never into the signed contract.
+    contract_block = source.split("contract = {", 1)[1].split("signature = fingerprint", 1)[0]
+    assert "training_profile" not in contract_block
+
+
+def test_training_profiler_is_packaged_for_both_lanes():
+    """Both releases ship the trainer, so both must ship its profiler."""
+    for script in ("scripts/package_qwen35_training.py", "scripts/package_training.py"):
+        source = (PROJECT / script).read_text(encoding="utf-8")
+        assert "src/cuhkx/training/profiling.py" in source, script
+        # The profiler imports the NVML sampler from the inference module.
+        assert "src/cuhkx/inference/profiling.py" in source, script
+
+
 def test_qwen35_train_lock_accepts_linux_markupsafe_wheel():
     lock = (PROJECT / "requirements/train_qwen35.lock.txt").read_text(encoding="utf-8")
     assert "--index-url https://pypi.org/simple" in lock

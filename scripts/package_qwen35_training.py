@@ -46,6 +46,7 @@ FILES = (
     "src/cuhkx/training/__init__.py", "src/cuhkx/training/dataset.py", "src/cuhkx/training/collator.py",
     "src/cuhkx/training/qwen35_support.py", "src/cuhkx/training/trainer.py",
     "src/cuhkx/training/adapter.py", "src/cuhkx/training/evaluate.py",
+    "src/cuhkx/training/profiling.py",
     "configs/baseline.yaml", "configs/qwen35_4b.yaml", "configs/training_qwen35.yaml",
     "configs/datasets.yaml", "configs/submission.yaml",
     "requirements/bootstrap.lock.txt", "requirements/cpu.in", "requirements/cpu.lock.txt", "requirements/qwen35.in",

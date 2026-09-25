@@ -20,6 +20,7 @@ from cuhkx.inference.weights import verify_weights, file_hash
 from cuhkx.training.adapter import text_targets, save_adapter_receipt, verify_adapter
 from cuhkx.training.collator import CompletionCollator
 from cuhkx.training.dataset import prepare_data, require_ready, TrainingDataset
+from cuhkx.training.profiling import TrainingProfiler
 
 
 CHECKPOINT_FILES = {"adapter_model.safetensors", "adapter_config.json", "optimizer.pt", "scheduler.pt", "trainer_state.json", "rng_state.pth", "scaler.pt"}
@@ -143,6 +144,15 @@ def train(config, settings, weights_dir, run_id, *, resume=False, gpu=0, smoke_s
                 "data_signature": prepared["data_signature"], "software": versions, "smoke_steps": smoke_steps,
                 "train_ids": [s["qa"]["qa_id"] for s in train_samples], "dev_ids": [s["qa"]["qa_id"] for s in dev_samples],
                 "prompts": fingerprint([build_mcq_prompt(s["qa"]) for s in train_samples+dev_samples]),
+                # Both settings reach TrainingArguments from code rather than from
+                # the YAML alone, so they are restated here: the signature must
+                # change when the optimizer backend or the loader parallelism
+                # changes, or a differently-trained adapter could be accepted as
+                # a resume of this run.
+                "training_execution": {"optim": settings["optimizer"]["optim"],
+                                       "dataloader_num_workers": settings["optimizer"]["dataloader_num_workers"],
+                                       "gradient_checkpointing": True,
+                                       "precision": "fp16"},
                 "fp16_grad_scaler": QWEN35_FP16_SCALER if qwen35 else "accelerate_default"}
     signature = fingerprint(contract)
     output = inside(Path(config["project_root"])/"artifacts/training", run_id)
@@ -191,6 +201,33 @@ def train(config, settings, weights_dir, run_id, *, resume=False, gpu=0, smoke_s
         class ReceiptCallback(TrainerCallback):
             def on_save(self, args, state, control, **kwargs):
                 checkpoint_receipt(output/f"checkpoint-{state.global_step}", signature)
+
+        # Step timing and device memory, recorded beside the run rather than in
+        # its contract, so a new metric can never invalidate a verified run.
+        profiler = TrainingProfiler(
+            samples_per_step=1,
+            scope="training_after_model_load").start()
+
+        class ProfilingCallback(TrainerCallback):
+            """Time each optimizer step without touching the training loop.
+
+            ``on_step_begin`` fires before the batch is fetched for that step, so
+            the span it opens covers the dataloader wait; the wait is closed as
+            soon as the step body starts, which is what makes the dataloader
+            share measurable instead of assumed.
+            """
+
+            def on_train_begin(self, args, state, control, **kwargs):
+                profiler.begin_batch()
+
+            def on_step_begin(self, args, state, control, **kwargs):
+                profiler.begin_step()
+
+            def on_step_end(self, args, state, control, **kwargs):
+                profiler.end_step(samples=1)
+                # Re-open the wait for the next batch; the last step leaves one
+                # pending, which summary() simply ignores.
+                profiler.begin_batch()
 
         class AnswerTrainer(Trainer):
             checked_gradients = False
@@ -260,7 +297,7 @@ def train(config, settings, weights_dir, run_id, *, resume=False, gpu=0, smoke_s
         arguments = TrainingArguments(output_dir=str(output), per_device_train_batch_size=1,
             per_device_eval_batch_size=1, gradient_accumulation_steps=opt["gradient_accumulation_steps"],
             learning_rate=opt["learning_rate"], num_train_epochs=opt["epochs"], max_steps=smoke_steps or -1,
-            **{warmup_name: opt["warmup_ratio"]}, max_grad_norm=opt["max_grad_norm"], optim="adamw_torch",
+            **{warmup_name: opt["warmup_ratio"]}, max_grad_norm=opt["max_grad_norm"], optim=opt["optim"],
             fp16=True, bf16=False, seed=opt["seed"], data_seed=opt["seed"], report_to=[],
             gradient_checkpointing=True, gradient_checkpointing_kwargs={"use_reentrant":False},
             remove_unused_columns=False, label_names=["labels"], eval_strategy="epoch", save_strategy="epoch",
@@ -268,14 +305,17 @@ def train(config, settings, weights_dir, run_id, *, resume=False, gpu=0, smoke_s
             # be the zero adapter and win/tie dev accuracy: smoke must retain last.
             save_total_limit=2, save_only_model=False, load_best_model_at_end=(smoke_steps is None),
             metric_for_best_model="accuracy", greater_is_better=True, logging_steps=1 if smoke_steps else 10,
-            dataloader_num_workers=0, push_to_hub=False)
+            # Collation is CPU-heavy here (four JPEG decodes plus two processor
+            # calls per sample); with 0 workers it sits on the critical path.
+            dataloader_num_workers=opt["dataloader_num_workers"], push_to_hub=False)
         trainer = AnswerTrainer(model=model,args=arguments,
             train_dataset=TrainingDataset(train_samples,config["data_root"]),
             eval_dataset=TrainingDataset(dev_samples,config["data_root"]),
             data_collator=(Qwen35CompletionCollator(processor, config["data_root"], opt["max_sequence_length"])
                            if qwen35 else CompletionCollator(processor,opt["max_sequence_length"])),
-            processing_class=processor,callbacks=[ReceiptCallback()])
+            processing_class=processor,callbacks=[ReceiptCallback(), ProfilingCallback()])
         trained, update_check = fit_and_validate(trainer, checkpoint)
+        training_profile = profiler.stop()
         adapter_dir = output/"adapter"
         trainer.model.save_pretrained(adapter_dir,safe_serialization=True)
         save_adapter_receipt(adapter_dir,base_source,signature,prepared["data_signature"],lora,targets,"smoke" if smoke_steps else "sft")
@@ -292,6 +332,10 @@ def train(config, settings, weights_dir, run_id, *, resume=False, gpu=0, smoke_s
                   "gradient_diagnostics":{"microbatches":trainer.gradient_microbatches,
                     "scaled_overflow_microbatches":trainer.scaled_overflow_microbatches,
                     "finite_nonzero_seen":trainer.checked_gradients},
+                  # Advisory evidence, not part of the verified contract: nothing
+                  # in verify/result checking reads it, so a metric change cannot
+                  # invalidate an already finished training run.
+                  "training_profile":training_profile,
                   "metrics":metrics,"adapter_receipt":adapter["receipt_sha256"]}
         write_json(output/"result.json",result)
         return result

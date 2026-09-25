@@ -26,10 +26,13 @@ FILES = (
     "src/cuhkx/data/__init__.py", "src/cuhkx/data/inputs.py", "src/cuhkx/data/validate.py",
     "src/cuhkx/inference/__init__.py", "src/cuhkx/inference/prompt.py", "src/cuhkx/inference/qwen.py",
     "src/cuhkx/inference/runner.py", "src/cuhkx/inference/storage.py", "src/cuhkx/inference/weights.py",
+    # The training profiler reuses the NVML sampler that lives here.
+    "src/cuhkx/inference/profiling.py",
     "src/cuhkx/evaluation/__init__.py", "src/cuhkx/evaluation/metric.py",
     "src/cuhkx/submission/__init__.py", "src/cuhkx/submission/validator.py", "src/cuhkx/submission/export.py",
     "src/cuhkx/training/__init__.py", "src/cuhkx/training/dataset.py", "src/cuhkx/training/collator.py",
     "src/cuhkx/training/trainer.py", "src/cuhkx/training/adapter.py", "src/cuhkx/training/evaluate.py",
+    "src/cuhkx/training/profiling.py",
     "configs/baseline.yaml", "configs/datasets.yaml", "configs/submission.yaml", "configs/training.yaml",
     "requirements/bootstrap.lock.txt", "requirements/cpu.in", "requirements/cpu.lock.txt",
     "requirements/cloud.in", "requirements/cloud.lock.txt",
