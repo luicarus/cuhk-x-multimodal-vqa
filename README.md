@@ -12,8 +12,8 @@
 |---|---:|---:|
 | Qwen2.5-VL-7B baseline | 0.41764 | — |
 | Qwen2.5-VL-7B QLoRA | 0.42058 | +0.00294 |
-| Qwen3.5-4B baseline | 0.44411 | — |
-| **Qwen3.5-4B QLoRA** | **0.54705** | **+0.10294** |
+| Qwen3.5-4B baseline | 0.45588 | — |
+| **Qwen3.5-4B QLoRA** | **0.54705** | **+0.09117** |
 
 ### 推理执行：Qwen3.5-4B baseline，2×T4
 
