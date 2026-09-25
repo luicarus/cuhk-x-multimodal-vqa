@@ -29,7 +29,9 @@ CELLS = [
 | 阶段 | 引擎 | 原因 |
 |---|---|---|
 | 训练 / 训练中 dev 评估 | Transformers 5.17.0 | vLLM 只做推理，无法反传梯度 |
-| adapter 重载、dev/confirm 评估、test 推理 | **vLLM 0.19.1，TP=2** | 两卡张量并行加速 |
+| adapter 重载、dev/confirm 评估、test 推理 | **vLLM 0.19.1，DP=2** | 每卡一份完整模型，卡间零通信 |
+
+推理阶段与推理 lane 的 DP2-B32 对齐：每个 replica 调度上限 16，Runner 全局批 32。T4 之间没有 NVLink，张量并行每层都要跨 PCIe all-reduce，因此改用数据并行。
 
 两边共用同一份数据契约、prompt、答案空间和运行校验，因此 vLLM 的分数与 Transformers 可直接比较。运行合同记录 `engine` 字段，同一 run-id 不会混用两种引擎的结果。
 """),
@@ -45,7 +47,7 @@ WEIGHTS_INPUT = None  # 可选：含 cuhkx_qwen35_weights.json 的完整 Qwen3.5
 EXPERIMENT = "qwen35_vllm_full_v1"
 TRAIN_GPU = 0          # 训练固定单卡，避免与 vLLM 进程争抢显存
 # 双卡拓扑：DP（每卡一份完整模型，卡间零通信）或 TP（一份模型切两卡，跨 PCIe
-# all-reduce）。T4 无 NVLink，本实验改用 DP，batch 从 32 减半到 16。
+# all-reduce）。T4 无 NVLink，本实验改用 DP。
 PARALLEL_MODE = "dp"
 DATA_PARALLEL = 2 if PARALLEL_MODE == "dp" else 1
 TENSOR_PARALLEL = 1 if PARALLEL_MODE == "dp" else 2
@@ -54,7 +56,11 @@ GPU_MEMORY_UTILIZATION = 0.80
 # 驱动，Kaggle 容器没有 stubs），报 "cannot find -lcuda"。TRITON_ATTN 是纯 Triton
 # 实现，不需要 nvcc/链接，因此作为默认值。
 ATTENTION_BACKEND = "TRITON_ATTN"
+# 后训练 lane 的推理阶段（adapter 重载 smoke、dev/confirm 评估、test 推理）与
+# 推理 lane 的 DP2-B32 对齐：每个 replica 调度上限 16，Runner 全局批 32。
+# 训练本身仍走 Transformers 单卡，只有这些推理步骤用 vLLM。
 MAX_NUM_SEQS = 16
+RUNNER_BATCH_SIZE = 32
 RUN_CONFIRMATION = False
 RUN_TEST = False
 PACKAGE_ID = "cuhkx-qwen35-4b-qlora-vllm-v1"
@@ -239,14 +245,15 @@ cloud("train", "--profile", "qwen35", "--training-config", str(TRAINING_CONFIG),
       "--weights-dir", str(WEIGHTS), "--run-id", "qwen35_pt_sft", "--gpu", str(TRAIN_GPU), "--resume")
 ADAPTER = REPO / "artifacts/training/qwen35_pt_sft/adapter"
 '''),
-    cell("markdown", "## 6. vLLM 双卡短跑：验证 TP=2 引擎、答案约束与 adapter 重载"),
+    cell("markdown", "## 6. vLLM 双卡短跑：验证 DP=2 引擎、答案约束与 adapter 重载"),
     cell("code", r'''
 VLLM = ["--backend", "vllm",
         "--tensor-parallel-size", str(TENSOR_PARALLEL),
         "--data-parallel-size", str(DATA_PARALLEL),
         "--gpu-memory-utilization", str(GPU_MEMORY_UTILIZATION),
         "--attention-backend", ATTENTION_BACKEND,
-        "--max-num-seqs", str(MAX_NUM_SEQS)]
+        "--max-num-seqs", str(MAX_NUM_SEQS),
+        "--runner-batch-size", str(RUNNER_BATCH_SIZE)]
 cloud("predict", "--profile", "qwen35", *VLLM,
       "--dataset", "pilot", "--limit", "16",
       "--weights-dir", str(WEIGHTS), "--adapter-dir", str(SMOKE_ADAPTER),
@@ -261,6 +268,16 @@ if PARALLEL_MODE == "dp" and backend_metadata.get("data_parallel_size") != DATA_
     raise RuntimeError(f"vLLM ran with DP={backend_metadata.get('data_parallel_size')}, expected {DATA_PARALLEL}")
 if backend_metadata.get("attention_backend") != ATTENTION_BACKEND:
     raise RuntimeError(f"vLLM ran with attention backend {backend_metadata.get('attention_backend')}, expected {ATTENTION_BACKEND}")
+# The two batch limits must be the ones requested, not whatever the engine
+# defaulted to: they are recorded in the signed contract and a silent fallback
+# would make this run incomparable with the aligned inference lane.
+smoke_options = json.loads(
+    (REPO / "outputs/qwen35_vllm_smoke_reload/resume_state.json").read_text()
+)["contract"]["engine_options"]
+if smoke_options.get("max_num_seqs") != MAX_NUM_SEQS:
+    raise RuntimeError(f"engine max_num_seqs={smoke_options.get('max_num_seqs')}, expected {MAX_NUM_SEQS}")
+if smoke_options.get("runner_batch_size") != RUNNER_BATCH_SIZE:
+    raise RuntimeError(f"runner_batch_size={smoke_options.get('runner_batch_size')}, expected {RUNNER_BATCH_SIZE}")
 workers = backend_metadata.get("workers") or {}
 if not workers.get("workers"):
     raise RuntimeError(f"worker memory telemetry is empty: {workers.get('error')}")
@@ -281,7 +298,8 @@ VLLM = ["--backend", "vllm",
         "--data-parallel-size", str(DATA_PARALLEL),
         "--gpu-memory-utilization", str(GPU_MEMORY_UTILIZATION),
         "--attention-backend", ATTENTION_BACKEND,
-        "--max-num-seqs", str(MAX_NUM_SEQS)]
+        "--max-num-seqs", str(MAX_NUM_SEQS),
+        "--runner-batch-size", str(RUNNER_BATCH_SIZE)]
 cloud("evaluate-training", "--profile", "qwen35", "--training-config", str(TRAINING_CONFIG),
       *VLLM, "--split", "dev", "--weights-dir", str(WEIGHTS),
       "--run-id", "qwen35_pt_base_dev", "--resume")
@@ -353,7 +371,7 @@ CELLS[0]["source"] = """# Qwen3.5-4B QLoRA: vLLM Dual-GPU
 
 This independent training notebook reuses the existing IR4 input protocol and embeds the complete five-fold cache. Create the package locally, copy its printed `manifest_sha256` into `EXPECTED_MANIFEST_SHA256` in the first code cell, and attach that exact `qwen35_4b_qlora.zip` as a private Kaggle input. This authenticates the manifest before any project code is copied or installed.
 
-Training and evaluation-under-training stay on Transformers, because vLLM is inference-only. Adapter reload checks, dev/confirm evaluation, and test inference run on **vLLM 0.19.1 with tensor parallelism across both T4 GPUs**. Both engines share the same data contract and constrained answer space, and the run contract records which engine produced each result.
+Training and evaluation-under-training stay on Transformers, because vLLM is inference-only. Adapter reload checks, dev/confirm evaluation, and test inference run on **vLLM 0.19.1 with one full replica per T4 (data parallel, DP=2, 16 sequences per replica and a 32-request Runner batch)**, matching the inference lane's DP2-B32 configuration. Both engines share the same data contract and constrained answer space, and the run contract records which engine produced each result.
 
 The package contains no model weights. Use a Kaggle 2x T4 session; the notebook verifies that both GPUs are visible before vLLM starts.
 """

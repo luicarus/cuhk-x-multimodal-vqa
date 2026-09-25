@@ -13,6 +13,20 @@ from cuhkx.evaluation.metric import available_option_letters, canonicalize_answe
 from cuhkx.inference.prompt import build_mcq_prompt, detect_prompt_leakage
 
 
+# Optimizer backends the training lane may name. All are bitsandbytes-backed or
+# plain torch, and all are safe with fp16 loss scaling.
+#
+# `paged_adamw_8bit` is the one worth reaching for on a 16 GB T4: a controlled
+# profiling study of QLoRA on an 8 GB consumer card measured ~25% higher
+# throughput with a paged 8-bit optimizer than with torch AdamW (628 vs 500
+# tok/s) and attributed it to optimizer memory traffic rather than to the
+# arithmetic. The paged variants trade a little host/device paging for a smaller
+# resident optimizer state, which is what lets a longer sequence or a larger
+# micro-batch fit at all.
+OPTIMIZERS = ("adamw_torch", "adamw_8bit", "paged_adamw_8bit",
+              "paged_adamw_32bit", "paged_lion_8bit")
+
+
 def load_training_config(config, path=None):
     project = Path(config["project_root"])
     if path is None:
@@ -41,11 +55,19 @@ def load_training_config(config, path=None):
     require(type(value["lora"]["alpha"]) is int and value["lora"]["alpha"] > 0, "invalid LoRA alpha")
     require(type(value["lora"]["dropout"]) in (int, float) and 0 <= value["lora"]["dropout"] < 1, "invalid dropout")
     opt = value["optimizer"]
-    keys(opt, {"learning_rate", "epochs", "gradient_accumulation_steps", "warmup_ratio", "max_grad_norm", "seed", "max_sequence_length"}, "optimizer")
+    keys(opt, {"learning_rate", "epochs", "gradient_accumulation_steps", "warmup_ratio", "max_grad_norm", "seed", "max_sequence_length", "optim", "dataloader_num_workers"}, "optimizer")
     for field in ("epochs", "gradient_accumulation_steps", "max_sequence_length", "seed"):
         require(type(opt[field]) is int and opt[field] > 0, f"invalid {field}")
     require(1 <= opt["epochs"] <= 2, "first training cycle supports one or two epochs")
     require(0 < opt["learning_rate"] <= 0.001 and 0 <= opt["warmup_ratio"] < 1 and opt["max_grad_norm"] > 0, "invalid optimizer parameters")
+    # The optimizer backend used to be hardcoded to adamw_torch, which made this
+    # choice invisible to the run signature. Naming it in the config puts it in
+    # the contract, so a run trained with a different optimizer can never be
+    # mistaken for a resume of this one.
+    require(opt["optim"] in OPTIMIZERS,
+            f"unsupported optimizer {opt['optim']!r}; expected one of {sorted(OPTIMIZERS)}")
+    workers = opt["dataloader_num_workers"]
+    require(type(workers) is int and 0 <= workers <= 8, "dataloader_num_workers must be 0..8")
     return value
 
 

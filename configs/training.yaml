@@ -32,3 +32,8 @@ optimizer:
   max_grad_norm: 1.0
   seed: 20260909
   max_sequence_length: 4096
+  # Same executor settings as the Qwen3.5 lane. The 7B lane already runs its
+  # base weights through the NF4 loader, so a paged 8-bit optimizer adds no new
+  # dependency and keeps the two lanes' execution settings comparable.
+  optim: paged_adamw_8bit
+  dataloader_num_workers: 2

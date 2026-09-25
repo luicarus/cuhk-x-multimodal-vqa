@@ -1,4 +1,4 @@
-﻿schema_version: 1
+schema_version: 1
 profile: qwen35_4b_qlora_v1
 qa: references/training_qa.csv
 folds: references/folds/subject_grouped_v1/qa_folds.csv
@@ -31,3 +31,10 @@ optimizer:
   max_grad_norm: 1.0
   seed: 20260911
   max_sequence_length: 4096
+  # Paged 8-bit keeps the optimizer state small and measured ~25% faster than
+  # torch AdamW for QLoRA on a memory-constrained card. It is part of the run
+  # signature, so changing it starts a new run instead of resuming this one.
+  optim: paged_adamw_8bit
+  # Collation decodes four JPEGs and runs the processor twice per sample, all on
+  # the critical path while this is 0. Workers overlap that with the forward pass.
+  dataloader_num_workers: 2
